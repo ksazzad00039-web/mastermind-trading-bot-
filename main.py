@@ -1,8 +1,14 @@
 import os
 import logging
 import threading
+from datetime import datetime, timezone
+
+import requests
+import pandas as pd
+import yfinance as yf
 
 from flask import Flask
+
 from dotenv import load_dotenv
 
 from telegram import (
@@ -10,12 +16,13 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
-    MessageHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
@@ -23,17 +30,17 @@ from google import genai
 
 
 # ============================================================
-# 1. ENVIRONMENT
+# CONFIG
 # ============================================================
 
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
 
 PORT = int(os.getenv("PORT", "10000"))
 
-# Use a current Gemini model available to your API account.
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
     "gemini-3.7-flash"
@@ -41,7 +48,7 @@ GEMINI_MODEL = os.getenv(
 
 
 # ============================================================
-# 2. LOGGING
+# LOGGING
 # ============================================================
 
 logging.basicConfig(
@@ -53,22 +60,18 @@ logger = logging.getLogger("MastermindBot")
 
 
 # ============================================================
-# 3. BASIC VALIDATION
+# ENV VALIDATION
 # ============================================================
 
 if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError(
-        "TELEGRAM_BOT_TOKEN is missing from environment variables."
-    )
+    raise RuntimeError("TELEGRAM_BOT_TOKEN is missing.")
 
 if not GEMINI_API_KEY:
-    raise RuntimeError(
-        "GEMINI_API_KEY is missing from environment variables."
-    )
+    raise RuntimeError("GEMINI_API_KEY is missing.")
 
 
 # ============================================================
-# 4. GEMINI CLIENT
+# GEMINI
 # ============================================================
 
 gemini_client = genai.Client(
@@ -77,7 +80,7 @@ gemini_client = genai.Client(
 
 
 # ============================================================
-# 5. FLASK HEALTH SERVER
+# FLASK HEALTH SERVER
 # ============================================================
 
 flask_app = Flask(__name__)
@@ -85,28 +88,46 @@ flask_app = Flask(__name__)
 
 @flask_app.route("/")
 def home():
+
     return {
+        "service": "Mastermind Market Intelligence Engine",
         "status": "online",
-        "service": "Mastermind Research Bot",
+
         "telegram": "configured",
         "gemini": "configured",
-        "market_data": "not_connected",
-        "analysis_engine": "not_active",
-        "paper_trading": "not_active",
+
+        "market_data": "active",
+        "news_engine": (
+            "configured"
+            if ALPHA_VANTAGE_API_KEY
+            else "not_configured"
+        ),
+
+        "analysis_engine": "step_2_foundation",
+
+        "trading_execution": "disabled",
     }
 
 
 @flask_app.route("/health")
 def health():
+
     return {
         "status": "healthy",
+
         "telegram": bool(TELEGRAM_BOT_TOKEN),
         "gemini": bool(GEMINI_API_KEY),
+
+        "market_data": True,
+
+        "news": bool(ALPHA_VANTAGE_API_KEY),
+
+        "execution": False,
     }
 
 
 def run_flask():
-    """Run Flask in a separate thread."""
+
     flask_app.run(
         host="0.0.0.0",
         port=PORT,
@@ -115,7 +136,46 @@ def run_flask():
 
 
 # ============================================================
-# 6. WATCHLIST
+# SYMBOL MAP
+# ============================================================
+
+SYMBOL_MAP = {
+
+    "EURUSD": "EURUSD=X",
+    "EUR/USD": "EURUSD=X",
+
+    "GBPUSD": "GBPUSD=X",
+    "GBP/USD": "GBPUSD=X",
+
+    "USDJPY": "JPY=X",
+    "USD/JPY": "JPY=X",
+
+    "USDCHF": "CHF=X",
+    "USD/CHF": "CHF=X",
+
+    "AUDUSD": "AUDUSD=X",
+    "AUD/USD": "AUDUSD=X",
+
+    "USDCAD": "CAD=X",
+    "USD/CAD": "CAD=X",
+
+    "NZDUSD": "NZDUSD=X",
+    "NZD/USD": "NZDUSD=X",
+
+    "GOLD": "GC=F",
+    "XAUUSD": "GC=F",
+    "XAU/USD": "GC=F",
+
+    "BTCUSD": "BTC-USD",
+    "BTC/USD": "BTC-USD",
+
+    "ETHUSD": "ETH-USD",
+    "ETH/USD": "ETH-USD",
+}
+
+
+# ============================================================
+# WATCHLIST
 # ============================================================
 
 WATCHLIST = [
@@ -133,281 +193,689 @@ WATCHLIST = [
 
 
 # ============================================================
-# 7. /START
+# DATA QUALITY CHECK
 # ============================================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def validate_dataframe(df):
+
+    if df is None:
+        return False, "DATAFRAME_NONE"
+
+    if df.empty:
+        return False, "EMPTY_DATA"
+
+    required = [
+        "Open",
+        "High",
+        "Low",
+        "Close",
+    ]
+
+    for column in required:
+
+        if column not in df.columns:
+            return False, f"MISSING_{column}"
+
+    if df[required].isnull().any().any():
+        return False, "NULL_VALUES"
+
+    if len(df) < 2:
+        return False, "INSUFFICIENT_DATA"
+
+    if not df.index.is_monotonic_increasing:
+        return False, "INVALID_TIME_ORDER"
+
+    return True, "OK"
+
+
+# ============================================================
+# MARKET DATA ENGINE
+# ============================================================
+
+def get_market_data(symbol, period="5d", interval="1h"):
+
+    yahoo_symbol = SYMBOL_MAP.get(
+        symbol.upper().strip()
+    )
+
+    if not yahoo_symbol:
+
+        return {
+            "status": "DATA_UNAVAILABLE",
+            "reason": "UNKNOWN_SYMBOL",
+            "symbol": symbol,
+        }
+
+    try:
+
+        df = yf.download(
+            yahoo_symbol,
+            period=period,
+            interval=interval,
+            progress=False,
+            auto_adjust=False,
+            threads=False,
+        )
+
+        if isinstance(df.columns, pd.MultiIndex):
+
+            df.columns = [
+                column[0]
+                for column in df.columns
+            ]
+
+        valid, reason = validate_dataframe(df)
+
+        if not valid:
+
+            return {
+                "status": "DATA_UNAVAILABLE",
+                "reason": reason,
+                "symbol": symbol,
+            }
+
+        latest = df.iloc[-1]
+
+        timestamp = df.index[-1]
+
+        return {
+            "status": "DATA_RECEIVED",
+            "symbol": symbol,
+            "source": "Yahoo Finance",
+            "provider_symbol": yahoo_symbol,
+
+            "timestamp": str(timestamp),
+
+            "open": float(latest["Open"]),
+            "high": float(latest["High"]),
+            "low": float(latest["Low"]),
+            "close": float(latest["Close"]),
+
+            "rows": len(df),
+        }
+
+    except Exception as error:
+
+        logger.exception(
+            "Market data error: %s",
+            error,
+        )
+
+        return {
+            "status": "DATA_UNAVAILABLE",
+            "reason": "FETCH_ERROR",
+            "symbol": symbol,
+        }
+
+
+# ============================================================
+# NEWS ENGINE
+# ============================================================
+
+def get_news(query="forex"):
+
+    if not ALPHA_VANTAGE_API_KEY:
+
+        return {
+            "status": "NEWS_UNAVAILABLE",
+            "reason": "API_KEY_NOT_CONFIGURED",
+            "items": [],
+        }
+
+    url = (
+        "https://www.alphavantage.co/query"
+    )
+
+    params = {
+        "function": "NEWS_SENTIMENT",
+        "tickers": query,
+        "apikey": ALPHA_VANTAGE_API_KEY,
+    }
+
+    try:
+
+        response = requests.get(
+            url,
+            params=params,
+            timeout=15,
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        feed = data.get("feed", [])
+
+        items = []
+
+        for item in feed[:10]:
+
+            items.append({
+
+                "title": item.get(
+                    "title",
+                    "Unknown",
+                ),
+
+                "source": item.get(
+                    "source",
+                    "Unknown",
+                ),
+
+                "published": item.get(
+                    "time_published",
+                    "Unknown",
+                ),
+
+                "url": item.get(
+                    "url",
+                    "",
+                ),
+
+                "summary": item.get(
+                    "summary",
+                    "",
+                ),
+
+            })
+
+        return {
+            "status": "NEWS_RECEIVED",
+            "items": items,
+        }
+
+    except Exception as error:
+
+        logger.exception(
+            "News error: %s",
+            error,
+        )
+
+        return {
+            "status": "NEWS_UNAVAILABLE",
+            "reason": "FETCH_ERROR",
+            "items": [],
+        }
+
+
+# ============================================================
+# FORMAT PRICE
+# ============================================================
+
+def format_price(data):
+
+    if data["status"] != "DATA_RECEIVED":
+
+        return (
+            "❌ *DATA UNAVAILABLE*\n\n"
+            f"Symbol: {data.get('symbol')}\n"
+            f"Reason: {data.get('reason')}\n\n"
+            "No price was invented."
+        )
+
+    return (
+        "📊 *MARKET DATA*\n\n"
+
+        f"Symbol: `{data['symbol']}`\n"
+
+        f"Price: `{data['close']}`\n"
+
+        f"Open: `{data['open']}`\n"
+        f"High: `{data['high']}`\n"
+        f"Low: `{data['low']}`\n\n"
+
+        f"Time: `{data['timestamp']}`\n"
+
+        f"Source: `{data['source']}`\n"
+
+        f"Rows: `{data['rows']}`\n\n"
+
+        "⚠️ Data source is Yahoo Finance. "
+        "It is not an exact OTC broker feed."
+    )
+
+
+# ============================================================
+# /START
+# ============================================================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
 
     keyboard = [
+
         [
             InlineKeyboardButton(
                 "📊 Watchlist",
-                callback_data="watchlist"
+                callback_data="watchlist",
             ),
+
             InlineKeyboardButton(
-                "🩺 System Health",
-                callback_data="health"
+                "🩺 Health",
+                callback_data="health",
             ),
         ],
+
         [
             InlineKeyboardButton(
-                "📘 Bot Guide",
-                callback_data="guide"
+                "📰 News",
+                callback_data="news",
             ),
+
             InlineKeyboardButton(
-                "🤖 AI Chat",
-                callback_data="chat"
+                "📘 Guide",
+                callback_data="guide",
             ),
         ],
     ]
 
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
     text = (
-        "🧠 *MASTERMIND RESEARCH BOT*\n\n"
-        "Welcome!\n\n"
-        "This is Step 1 of the research system.\n\n"
-        "✅ Telegram Core: ACTIVE\n"
-        "✅ Gemini AI: CONFIGURED\n"
-        "⏳ Market Data: NOT CONNECTED\n"
-        "⏳ Analysis Engine: NOT ACTIVE\n"
-        "⏳ Backtesting: NOT ACTIVE\n"
-        "⏳ Paper Trading: NOT ACTIVE\n\n"
-        "Choose an option below."
+        "🧠 *MASTERMIND MARKET INTELLIGENCE*\n\n"
+
+        "Step 2A is active.\n\n"
+
+        "✅ Telegram Core\n"
+        "✅ Market Data Engine\n"
+        "✅ Data Validation\n"
+        "✅ News Engine\n"
+        "✅ Gemini AI\n\n"
+
+        "⏳ ICT/SMC Engine\n"
+        "⏳ Multi-Timeframe Engine\n"
+        "⏳ Backtesting Engine\n\n"
+
+        "Select an option."
     )
 
     await update.message.reply_text(
         text,
-        reply_markup=reply_markup,
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        ),
         parse_mode="Markdown",
     )
 
 
 # ============================================================
-# 8. WATCHLIST
+# /PRICE COMMAND
+# ============================================================
+
+async def price_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not context.args:
+
+        await update.message.reply_text(
+            "Example:\n\n"
+            "`/price EURUSD`\n"
+            "`/price XAUUSD`\n"
+            "`/price BTCUSD`",
+            parse_mode="Markdown",
+        )
+
+        return
+
+    symbol = context.args[0]
+
+    await update.message.reply_text(
+        "🔎 Fetching market data..."
+    )
+
+    data = get_market_data(
+        symbol=symbol,
+        period="5d",
+        interval="1h",
+    )
+
+    await update.message.reply_text(
+        format_price(data),
+        parse_mode="Markdown",
+    )
+
+
+# ============================================================
+# /NEWS COMMAND
+# ============================================================
+
+async def news_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    query = "forex"
+
+    if context.args:
+
+        query = context.args[0]
+
+    await update.message.reply_text(
+        "📰 Fetching available news..."
+    )
+
+    result = get_news(query)
+
+    if result["status"] != "NEWS_RECEIVED":
+
+        await update.message.reply_text(
+            "❌ *NEWS UNAVAILABLE*\n\n"
+            f"Reason: `{result['reason']}`\n\n"
+            "No news has been invented.",
+            parse_mode="Markdown",
+        )
+
+        return
+
+    items = result["items"]
+
+    if not items:
+
+        await update.message.reply_text(
+            "ℹ️ No news items returned."
+        )
+
+        return
+
+    text = "📰 *LATEST AVAILABLE NEWS*\n\n"
+
+    for index, item in enumerate(
+        items[:5],
+        start=1,
+    ):
+
+        title = item["title"]
+
+        source = item["source"]
+
+        published = item["published"]
+
+        text += (
+            f"*{index}.* {title}\n"
+            f"Source: {source}\n"
+            f"Published: {published}\n\n"
+        )
+
+    await update.message.reply_text(
+        text,
+        parse_mode="Markdown",
+    )
+
+
+# ============================================================
+# WATCHLIST BUTTON
 # ============================================================
 
 async def show_watchlist(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
     query = update.callback_query
+
     await query.answer()
 
-    symbols = "\n".join(
-        f"• {symbol}" for symbol in WATCHLIST
-    )
-
     text = (
-        "📊 *CURRENT WATCHLIST*\n\n"
-        f"{symbols}\n\n"
-        "⚠️ These are watchlist labels only.\n"
-        "No live market data is connected yet."
+        "📊 *WATCHLIST*\n\n"
+        + "\n".join(
+            f"• {symbol}"
+            for symbol in WATCHLIST
+        )
     )
 
     keyboard = [
+
         [
             InlineKeyboardButton(
                 "⬅️ Back",
-                callback_data="back"
+                callback_data="back",
             )
         ]
+
     ]
 
     await query.edit_message_text(
         text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        ),
         parse_mode="Markdown",
     )
 
 
 # ============================================================
-# 9. SYSTEM HEALTH
+# HEALTH BUTTON
 # ============================================================
 
 async def show_health(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
     query = update.callback_query
+
     await query.answer()
+
+    news_status = (
+        "CONFIGURED"
+        if ALPHA_VANTAGE_API_KEY
+        else "NOT CONFIGURED"
+    )
 
     text = (
         "🩺 *SYSTEM HEALTH*\n\n"
-        "🟢 Telegram Core: ONLINE\n"
-        "🟢 Flask Server: ONLINE\n"
-        "🟢 Gemini Client: CONFIGURED\n"
-        "🟡 Market Data Engine: NOT CONNECTED\n"
-        "🟡 Analysis Engine: NOT ACTIVE\n"
-        "🟡 News Engine: NOT CONNECTED\n"
-        "🟡 Backtesting Engine: NOT ACTIVE\n"
+
+        "🟢 Telegram: ONLINE\n"
+        "🟢 Flask: ONLINE\n"
+        "🟢 Gemini: CONFIGURED\n"
+        "🟢 Market Data: ACTIVE\n"
+
+        f"🟡 News: {news_status}\n"
+
+        "🟡 ICT/SMC: NOT ACTIVE\n"
+        "🟡 Backtesting: NOT ACTIVE\n"
         "🟡 Paper Trading: NOT ACTIVE\n\n"
-        "System foundation is ready."
+
+        "🔒 Real-money execution: DISABLED"
     )
 
     keyboard = [
+
         [
             InlineKeyboardButton(
                 "🔄 Refresh",
-                callback_data="health"
+                callback_data="health",
             ),
+
             InlineKeyboardButton(
                 "⬅️ Back",
-                callback_data="back"
+                callback_data="back",
             ),
         ]
+
     ]
 
     await query.edit_message_text(
         text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        ),
         parse_mode="Markdown",
     )
 
 
 # ============================================================
-# 10. BOT GUIDE
+# NEWS BUTTON
+# ============================================================
+
+async def show_news(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    result = get_news("forex")
+
+    if result["status"] != "NEWS_RECEIVED":
+
+        text = (
+            "❌ *NEWS ENGINE*\n\n"
+            "News data is currently unavailable.\n\n"
+            f"Reason: {result['reason']}"
+        )
+
+    else:
+
+        items = result["items"]
+
+        text = "📰 *NEWS ENGINE*\n\n"
+
+        for item in items[:5]:
+
+            text += (
+                f"• {item['title']}\n"
+                f"  Source: {item['source']}\n"
+                f"  Time: {item['published']}\n\n"
+            )
+
+    keyboard = [
+
+        [
+            InlineKeyboardButton(
+                "⬅️ Back",
+                callback_data="back",
+            )
+        ]
+
+    ]
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        ),
+        parse_mode="Markdown",
+    )
+
+
+# ============================================================
+# GUIDE
 # ============================================================
 
 async def show_guide(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
     query = update.callback_query
+
     await query.answer()
 
     text = (
-        "📘 *BOT GUIDE*\n\n"
-        "*Step 1 — Core*\n"
-        "Telegram + Gemini + Health Server\n\n"
-        "*Step 2 — Data*\n"
-        "Historical/market data pipeline\n\n"
-        "*Step 3 — Analysis*\n"
-        "Indicators + market structure + statistics\n\n"
-        "*Step 4 — Context*\n"
-        "Sessions, volatility, news and correlations\n\n"
-        "*Step 5 — Backtesting*\n"
-        "Historical testing with no look-ahead\n\n"
-        "*Step 6 — Paper Trading*\n"
-        "Simulation and performance tracking\n\n"
-        "⚠️ No real-money execution is included."
+        "📘 *STEP 2 ROADMAP*\n\n"
+
+        "1️⃣ Data Integrity\n"
+        "2️⃣ Market Data\n"
+        "3️⃣ News Intelligence\n"
+        "4️⃣ Multi-Timeframe\n"
+        "5️⃣ Indicators\n"
+        "6️⃣ Market Structure\n"
+        "7️⃣ ICT/SMC Research Layer\n"
+        "8️⃣ Statistical Engine\n"
+        "9️⃣ Backtesting\n"
+        "🔟 Paper Trading\n\n"
+
+        "The system will never create a "
+        "price or news item when reliable data "
+        "is unavailable."
     )
 
     keyboard = [
+
         [
             InlineKeyboardButton(
                 "⬅️ Back",
-                callback_data="back"
+                callback_data="back",
             )
         ]
+
     ]
 
     await query.edit_message_text(
         text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        ),
         parse_mode="Markdown",
     )
 
 
 # ============================================================
-# 11. AI CHAT INFO
-# ============================================================
-
-async def show_chat_info(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-    await query.answer()
-
-    text = (
-        "🤖 *AI CHAT*\n\n"
-        "Send me a normal text message and Gemini "
-        "will answer.\n\n"
-        "Example:\n"
-        "• Explain RSI\n"
-        "• What is market structure?\n"
-        "• Explain support and resistance\n\n"
-        "The AI does not have live market data yet."
-    )
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "⬅️ Back",
-                callback_data="back"
-            )
-        ]
-    ]
-
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown",
-    )
-
-
-# ============================================================
-# 12. BACK BUTTON
+# BACK
 # ============================================================
 
 async def back_to_menu(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
     query = update.callback_query
+
     await query.answer()
 
     keyboard = [
+
         [
             InlineKeyboardButton(
                 "📊 Watchlist",
-                callback_data="watchlist"
+                callback_data="watchlist",
             ),
+
             InlineKeyboardButton(
-                "🩺 System Health",
-                callback_data="health"
+                "🩺 Health",
+                callback_data="health",
             ),
         ],
+
         [
             InlineKeyboardButton(
-                "📘 Bot Guide",
-                callback_data="guide"
+                "📰 News",
+                callback_data="news",
             ),
+
             InlineKeyboardButton(
-                "🤖 AI Chat",
-                callback_data="chat"
+                "📘 Guide",
+                callback_data="guide",
             ),
         ],
+
     ]
 
-    text = (
-        "🧠 *MASTERMIND RESEARCH BOT*\n\n"
-        "Choose an option below."
-    )
-
     await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        "🧠 *MASTERMIND MARKET INTELLIGENCE*\n\n"
+        "Choose an option.",
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        ),
         parse_mode="Markdown",
     )
 
 
 # ============================================================
-# 13. GEMINI AI CHAT
+# GEMINI CHAT
 # ============================================================
 
 async def handle_message(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not update.message or not update.message.text:
+    if not update.message:
         return
 
     user_text = update.message.text.strip()
@@ -415,113 +883,150 @@ async def handle_message(
     if not user_text:
         return
 
-    await update.message.chat.send_action("typing")
+    await update.message.chat.send_action(
+        "typing"
+    )
 
     prompt = f"""
-You are the educational AI assistant inside
-the Mastermind Research Bot.
+You are the educational AI assistant
+inside the Mastermind Market Intelligence
+research system.
 
-Important rules:
+You may explain:
 
-1. Give educational explanations.
-2. Do not claim to have live market data unless
-   live data is actually provided.
-3. Do not guarantee future market direction.
-4. Do not claim guaranteed accuracy or profit.
-5. Explain technical concepts clearly.
-6. If information is missing, say so.
+- market structure
+- price action
+- ICT concepts
+- SMC concepts
+- indicators
+- trading psychology
+- risk management
+- statistics
+- backtesting
+- financial-market concepts
 
-User message:
+Rules:
+
+1. Never invent market data.
+2. Never claim live data unless it is actually supplied.
+3. Never guarantee future prices.
+4. Never claim guaranteed profit.
+5. Clearly distinguish facts from interpretation.
+6. Explain uncertainty when evidence is incomplete.
+
+User question:
 
 {user_text}
 """
 
     try:
 
-        response = await gemini_client.aio.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
+        response = await (
+            gemini_client
+            .aio
+            .models
+            .generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+            )
         )
 
         answer = response.text
 
         if not answer:
+
             answer = (
-                "I couldn't generate a response right now."
+                "No response was generated."
             )
 
-        await update.message.reply_text(answer)
+        await update.message.reply_text(
+            answer
+        )
 
     except Exception as error:
 
         logger.exception(
-            "Gemini request failed: %s",
-            error
+            "Gemini error: %s",
+            error,
         )
 
         await update.message.reply_text(
-            "⚠️ AI service is temporarily unavailable. "
-            "Please try again later."
+            "⚠️ AI service is temporarily unavailable."
         )
 
 
 # ============================================================
-# 14. BUTTON HANDLER
+# BUTTON ROUTER
 # ============================================================
 
 async def button_handler(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
     query = update.callback_query
 
     if query.data == "watchlist":
-        await show_watchlist(update, context)
+
+        await show_watchlist(
+            update,
+            context,
+        )
 
     elif query.data == "health":
-        await show_health(update, context)
+
+        await show_health(
+            update,
+            context,
+        )
+
+    elif query.data == "news":
+
+        await show_news(
+            update,
+            context,
+        )
 
     elif query.data == "guide":
-        await show_guide(update, context)
 
-    elif query.data == "chat":
-        await show_chat_info(update, context)
+        await show_guide(
+            update,
+            context,
+        )
 
     elif query.data == "back":
-        await back_to_menu(update, context)
 
-    else:
-        await query.answer(
-            "Unknown option.",
-            show_alert=True
+        await back_to_menu(
+            update,
+            context,
         )
 
 
 # ============================================================
-# 15. GLOBAL ERROR HANDLER
+# ERROR HANDLER
 # ============================================================
 
 async def error_handler(
     update: object,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
     logger.exception(
-        "Unhandled Telegram error:",
+        "Unhandled error:",
         exc_info=context.error,
     )
 
 
 # ============================================================
-# 16. MAIN
+# MAIN
 # ============================================================
 
 def main():
 
-    logger.info("Starting Mastermind Research Bot...")
+    logger.info(
+        "Starting Mastermind Bot..."
+    )
 
-    # Start Flask health server
     flask_thread = threading.Thread(
         target=run_flask,
         daemon=True,
@@ -529,30 +1034,44 @@ def main():
 
     flask_thread.start()
 
-    logger.info(
-        "Health server started on port %s",
-        PORT
-    )
-
-    # Create Telegram application
     application = (
-        Application.builder()
+        Application
+        .builder()
         .token(TELEGRAM_BOT_TOKEN)
         .build()
     )
 
-    # Handlers
     application.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            "start",
+            start,
+        )
     )
 
     application.add_handler(
-        CallbackQueryHandler(button_handler)
+        CommandHandler(
+            "price",
+            price_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "news",
+            news_command,
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            button_handler,
+        )
     )
 
     application.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
+            filters.TEXT
+            & ~filters.COMMAND,
             handle_message,
         )
     )
@@ -561,17 +1080,19 @@ def main():
         error_handler
     )
 
-    logger.info("Telegram bot is starting...")
+    logger.info(
+        "Telegram bot is running..."
+    )
 
-    # Start polling
     application.run_polling(
         allowed_updates=Update.ALL_TYPES
     )
 
 
 # ============================================================
-# 17. ENTRY POINT
+# ENTRY POINT
 # ============================================================
 
 if __name__ == "__main__":
+
     main()
