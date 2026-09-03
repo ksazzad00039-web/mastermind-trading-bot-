@@ -2081,3 +2081,1500 @@ def main():
 if __name__ == "__main__":
 
     main()
+    # ============================================================
+# STEP 2C + 2D + 2E + 2F
+# PROFESSIONAL MARKET RESEARCH ENGINE
+# ============================================================
+
+import pandas as pd
+import numpy as np
+
+
+# ============================================================
+# 2C — ICT / SMC + MARKET STRUCTURE ENGINE
+# ============================================================
+
+def detect_swing_points(df, lookback=3):
+    """Confirmed historical swing high/low detection."""
+
+    try:
+        df = df.copy()
+
+        df["Swing_High"] = False
+        df["Swing_Low"] = False
+
+        if len(df) < (lookback * 2 + 1):
+            return df
+
+        for i in range(lookback, len(df) - lookback):
+
+            current_high = df["High"].iloc[i]
+            current_low = df["Low"].iloc[i]
+
+            left_highs = df["High"].iloc[i-lookback:i]
+            right_highs = df["High"].iloc[i+1:i+lookback+1]
+
+            left_lows = df["Low"].iloc[i-lookback:i]
+            right_lows = df["Low"].iloc[i+1:i+lookback+1]
+
+            if (
+                current_high > left_highs.max()
+                and current_high > right_highs.max()
+            ):
+                df.loc[df.index[i], "Swing_High"] = True
+
+            if (
+                current_low < left_lows.min()
+                and current_low < right_lows.min()
+            ):
+                df.loc[df.index[i], "Swing_Low"] = True
+
+        return df
+
+    except Exception as e:
+        logger.error(f"Swing detection error: {e}")
+        return df
+
+
+# ------------------------------------------------------------
+# MARKET STRUCTURE
+# ------------------------------------------------------------
+
+def determine_structure(df):
+
+    try:
+        if len(df) < 20:
+            return {
+                "structure": "UNKNOWN",
+                "reason": "Insufficient candles"
+            }
+
+        df = detect_swing_points(df)
+
+        highs = df[df["Swing_High"]]
+        lows = df[df["Swing_Low"]]
+
+        if len(highs) < 2 or len(lows) < 2:
+            return {
+                "structure": "UNKNOWN",
+                "reason": "Insufficient confirmed swing points"
+            }
+
+        previous_high = float(highs["High"].iloc[-2])
+        latest_high = float(highs["High"].iloc[-1])
+
+        previous_low = float(lows["Low"].iloc[-2])
+        latest_low = float(lows["Low"].iloc[-1])
+
+        if latest_high > previous_high and latest_low > previous_low:
+
+            structure = "BULLISH_STRUCTURE"
+
+        elif latest_high < previous_high and latest_low < previous_low:
+
+            structure = "BEARISH_STRUCTURE"
+
+        else:
+
+            structure = "MIXED_STRUCTURE"
+
+        return {
+            "structure": structure,
+            "last_swing_high": latest_high,
+            "last_swing_low": latest_low,
+            "previous_swing_high": previous_high,
+            "previous_swing_low": previous_low
+        }
+
+    except Exception as e:
+
+        logger.error(f"Structure error: {e}")
+
+        return {
+            "structure": "UNKNOWN",
+            "reason": str(e)
+        }
+
+
+# ------------------------------------------------------------
+# LIQUIDITY SWEEP vs BOS
+# ------------------------------------------------------------
+
+def detect_liquidity_event(df):
+
+    try:
+
+        if len(df) < 10:
+            return {
+                "event": "UNKNOWN",
+                "confirmation": False
+            }
+
+        df = detect_swing_points(df)
+
+        swing_highs = df[df["Swing_High"]]
+        swing_lows = df[df["Swing_Low"]]
+
+        last = df.iloc[-1]
+
+        result = {
+            "event": "NONE",
+            "level": None,
+            "confirmation": False
+        }
+
+        # -------------------------
+        # BUY-SIDE LIQUIDITY
+        # -------------------------
+
+        if len(swing_highs) > 0:
+
+            level = float(
+                swing_highs["High"].iloc[-1]
+            )
+
+            if last["High"] > level:
+
+                if last["Close"] <= level:
+
+                    return {
+                        "event": "BUY_SIDE_LIQUIDITY_SWEEP",
+                        "level": level,
+                        "confirmation": False
+                    }
+
+                elif last["Close"] > level:
+
+                    return {
+                        "event": "POTENTIAL_BULLISH_BOS",
+                        "level": level,
+                        "confirmation": True
+                    }
+
+        # -------------------------
+        # SELL-SIDE LIQUIDITY
+        # -------------------------
+
+        if len(swing_lows) > 0:
+
+            level = float(
+                swing_lows["Low"].iloc[-1]
+            )
+
+            if last["Low"] < level:
+
+                if last["Close"] >= level:
+
+                    return {
+                        "event": "SELL_SIDE_LIQUIDITY_SWEEP",
+                        "level": level,
+                        "confirmation": False
+                    }
+
+                elif last["Close"] < level:
+
+                    return {
+                        "event": "POTENTIAL_BEARISH_BOS",
+                        "level": level,
+                        "confirmation": True
+                    }
+
+        return result
+
+    except Exception as e:
+
+        logger.error(f"Liquidity error: {e}")
+
+        return {
+            "event": "UNKNOWN",
+            "confirmation": False
+        }
+
+
+# ------------------------------------------------------------
+# FAIR VALUE GAP
+# ------------------------------------------------------------
+
+def detect_fvg(df):
+
+    try:
+
+        if len(df) < 3:
+            return []
+
+        fvg_list = []
+
+        for i in range(2, len(df)):
+
+            candle_1_high = float(
+                df["High"].iloc[i - 2]
+            )
+
+            candle_1_low = float(
+                df["Low"].iloc[i - 2]
+            )
+
+            candle_3_high = float(
+                df["High"].iloc[i]
+            )
+
+            candle_3_low = float(
+                df["Low"].iloc[i]
+            )
+
+            # Bullish FVG
+            if candle_3_low > candle_1_high:
+
+                fvg_list.append({
+                    "type": "BULLISH_FVG",
+                    "low": candle_1_high,
+                    "high": candle_3_low,
+                    "index": i
+                })
+
+            # Bearish FVG
+            elif candle_3_high < candle_1_low:
+
+                fvg_list.append({
+                    "type": "BEARISH_FVG",
+                    "low": candle_3_high,
+                    "high": candle_1_low,
+                    "index": i
+                })
+
+        return fvg_list[-10:]
+
+    except Exception as e:
+
+        logger.error(f"FVG error: {e}")
+
+        return []
+
+
+# ------------------------------------------------------------
+# ORDER BLOCK
+# ------------------------------------------------------------
+
+def detect_order_blocks(df):
+
+    try:
+
+        if len(df) < 10:
+            return []
+
+        blocks = []
+
+        for i in range(1, len(df)):
+
+            previous = df.iloc[i - 1]
+            current = df.iloc[i]
+
+            # Bullish OB
+            if (
+                previous["Close"] < previous["Open"]
+                and current["Close"] > current["Open"]
+                and current["Close"] > previous["High"]
+            ):
+
+                blocks.append({
+                    "type": "BULLISH_OB",
+                    "low": float(previous["Low"]),
+                    "high": float(previous["High"]),
+                    "index": i - 1
+                })
+
+            # Bearish OB
+            elif (
+                previous["Close"] > previous["Open"]
+                and current["Close"] < current["Open"]
+                and current["Close"] < previous["Low"]
+            ):
+
+                blocks.append({
+                    "type": "BEARISH_OB",
+                    "low": float(previous["Low"]),
+                    "high": float(previous["High"]),
+                    "index": i - 1
+                })
+
+        return blocks[-10:]
+
+    except Exception as e:
+
+        logger.error(f"Order block error: {e}")
+
+        return []
+
+
+# ------------------------------------------------------------
+# PREMIUM / DISCOUNT
+# ------------------------------------------------------------
+
+def premium_discount_analysis(df):
+
+    try:
+
+        df = detect_swing_points(df)
+
+        highs = df[df["Swing_High"]]
+        lows = df[df["Swing_Low"]]
+
+        if highs.empty or lows.empty:
+
+            return {
+                "zone": "UNKNOWN"
+            }
+
+        swing_high = float(
+            highs["High"].iloc[-1]
+        )
+
+        swing_low = float(
+            lows["Low"].iloc[-1]
+        )
+
+        midpoint = (
+            swing_high + swing_low
+        ) / 2
+
+        price = float(
+            df["Close"].iloc[-1]
+        )
+
+        if price > midpoint:
+
+            zone = "PREMIUM"
+
+        elif price < midpoint:
+
+            zone = "DISCOUNT"
+
+        else:
+
+            zone = "EQUILIBRIUM"
+
+        return {
+            "zone": zone,
+            "swing_high": swing_high,
+            "swing_low": swing_low,
+            "midpoint": midpoint,
+            "price": price
+        }
+
+    except Exception as e:
+
+        logger.error(
+            f"Premium/Discount error: {e}"
+        )
+
+        return {
+            "zone": "UNKNOWN"
+        }
+
+
+# ============================================================
+# 2D — CONFLUENCE ENGINE
+# ============================================================
+
+def build_confluence(
+    technical,
+    structure,
+    liquidity,
+    pd_zone,
+    fvg_list,
+    order_blocks
+):
+
+    evidence = []
+    conflicts = []
+
+    score = 0
+
+    # -------------------------
+    # STRUCTURE
+    # -------------------------
+
+    struct = structure.get(
+        "structure",
+        "UNKNOWN"
+    )
+
+    if struct == "BULLISH_STRUCTURE":
+
+        evidence.append(
+            "Bullish market structure"
+        )
+
+        score += 20
+
+    elif struct == "BEARISH_STRUCTURE":
+
+        evidence.append(
+            "Bearish market structure"
+        )
+
+        score += 20
+
+    else:
+
+        conflicts.append(
+            "Structure mixed or uncertain"
+        )
+
+    # -------------------------
+    # REGIME
+    # -------------------------
+
+    regime = technical.get(
+        "regime",
+        "UNKNOWN"
+    )
+
+    if regime in [
+        "BULLISH_TRENDING",
+        "BEARISH_TRENDING"
+    ]:
+
+        evidence.append(
+            f"Market regime: {regime}"
+        )
+
+        score += 10
+
+    elif regime == "SIDEWAYS_RANGE":
+
+        conflicts.append(
+            "Market is ranging"
+        )
+
+    # -------------------------
+    # LIQUIDITY
+    # -------------------------
+
+    event = liquidity.get(
+        "event",
+        "NONE"
+    )
+
+    if "SWEEP" in event:
+
+        evidence.append(event)
+
+        score += 15
+
+    elif "BOS" in event:
+
+        evidence.append(
+            "Potential BOS with candle close"
+        )
+
+        score += 20
+
+    # -------------------------
+    # PREMIUM / DISCOUNT
+    # -------------------------
+
+    zone = pd_zone.get(
+        "zone",
+        "UNKNOWN"
+    )
+
+    if zone == "DISCOUNT":
+
+        evidence.append(
+            "Price in discount zone"
+        )
+
+        score += 10
+
+    elif zone == "PREMIUM":
+
+        evidence.append(
+            "Price in premium zone"
+        )
+
+        score += 10
+
+    else:
+
+        conflicts.append(
+            "Premium/Discount unavailable"
+        )
+
+    # -------------------------
+    # FVG
+    # -------------------------
+
+    if fvg_list:
+
+        evidence.append(
+            "Recent FVG detected"
+        )
+
+        score += 10
+
+    # -------------------------
+    # ORDER BLOCK
+    # -------------------------
+
+    if order_blocks:
+
+        evidence.append(
+            "Recent Order Block detected"
+        )
+
+        score += 10
+
+    score = min(score, 100)
+
+    if conflicts:
+
+        status = "CONDITIONAL"
+
+    elif score >= 70:
+
+        status = "STRONG_RESEARCH_SETUP"
+
+    elif score >= 50:
+
+        status = "MODERATE_RESEARCH_SETUP"
+
+    else:
+
+        status = "WAIT"
+
+    return {
+        "score": score,
+        "status": status,
+        "evidence": evidence,
+        "conflicts": conflicts
+    }
+
+
+# ============================================================
+# SCENARIO ENGINE
+# ============================================================
+
+def build_scenarios(
+    structure,
+    liquidity,
+    pd_zone
+):
+
+    scenarios = []
+
+    struct = structure.get(
+        "structure"
+    )
+
+    event = liquidity.get(
+        "event"
+    )
+
+    zone = pd_zone.get(
+        "zone"
+    )
+
+    if struct == "BULLISH_STRUCTURE":
+
+        scenarios.append({
+
+            "scenario":
+                "BULLISH_CONTINUATION",
+
+            "confirmation":
+                "Bullish structure remains intact and continuation is confirmed.",
+
+            "invalidation":
+                "Relevant bullish swing low is broken."
+        })
+
+    if struct == "BEARISH_STRUCTURE":
+
+        scenarios.append({
+
+            "scenario":
+                "BEARISH_CONTINUATION",
+
+            "confirmation":
+                "Bearish structure remains intact and continuation is confirmed.",
+
+            "invalidation":
+                "Relevant bearish swing high is broken."
+        })
+
+    if "SWEEP" in event:
+
+        scenarios.append({
+
+            "scenario":
+                "LIQUIDITY_SWEEP",
+
+            "confirmation":
+                "Sweep followed by structure confirmation.",
+
+            "invalidation":
+                "Price continues through the swept level."
+        })
+
+    if zone == "EQUILIBRIUM":
+
+        scenarios.append({
+
+            "scenario":
+                "MID_RANGE",
+
+            "confirmation":
+                "Wait for price to reach a clearer structural area.",
+
+            "invalidation":
+                "New confirmed structure develops."
+        })
+
+    return scenarios
+
+
+# ============================================================
+# 2E — TP / SL RESEARCH ENGINE
+# ============================================================
+
+def calculate_research_tp_sl(
+    df,
+    structure,
+    direction="AUTO",
+    rr_levels=(1.5, 2.0, 3.0)
+):
+
+    try:
+
+        if len(df) < 20:
+
+            return {
+                "status": "UNAVAILABLE",
+                "reason": "Insufficient data"
+            }
+
+        price = float(
+            df["Close"].iloc[-1]
+        )
+
+        if "ATR" not in df.columns:
+
+            return {
+                "status": "UNAVAILABLE",
+                "reason": "ATR column unavailable"
+            }
+
+        atr = df["ATR"].iloc[-1]
+
+        if pd.isna(atr) or atr <= 0:
+
+            return {
+                "status": "UNAVAILABLE",
+                "reason": "ATR unavailable"
+            }
+
+        if direction == "AUTO":
+
+            if structure.get(
+                "structure"
+            ) == "BULLISH_STRUCTURE":
+
+                direction = "BULLISH"
+
+            elif structure.get(
+                "structure"
+            ) == "BEARISH_STRUCTURE":
+
+                direction = "BEARISH"
+
+            else:
+
+                return {
+                    "status": "WAIT",
+                    "reason": "Direction uncertain"
+                }
+
+        swing_high = structure.get(
+            "last_swing_high"
+        )
+
+        swing_low = structure.get(
+            "last_swing_low"
+        )
+
+        if swing_high is None or swing_low is None:
+
+            return {
+                "status": "WAIT",
+                "reason": "Structure levels unavailable"
+            }
+
+        # -------------------------
+        # BULLISH
+        # -------------------------
+
+        if direction == "BULLISH":
+
+            sl = swing_low - (
+                0.25 * atr
+            )
+
+            risk = price - sl
+
+            if risk <= 0:
+
+                return {
+                    "status": "WAIT",
+                    "reason":
+                        "Invalid bullish geometry"
+                }
+
+            targets = {}
+
+            for rr in rr_levels:
+
+                targets[
+                    f"TP_{rr:g}R"
+                ] = price + (
+                    risk * rr
+                )
+
+        # -------------------------
+        # BEARISH
+        # -------------------------
+
+        else:
+
+            sl = swing_high + (
+                0.25 * atr
+            )
+
+            risk = sl - price
+
+            if risk <= 0:
+
+                return {
+                    "status": "WAIT",
+                    "reason":
+                        "Invalid bearish geometry"
+                }
+
+            targets = {}
+
+            for rr in rr_levels:
+
+                targets[
+                    f"TP_{rr:g}R"
+                ] = price - (
+                    risk * rr
+                )
+
+        return {
+
+            "status":
+                "RESEARCH_ONLY",
+
+            "direction":
+                direction,
+
+            "reference_price":
+                price,
+
+            "research_sl":
+                sl,
+
+            "risk_distance":
+                risk,
+
+            "targets":
+                targets,
+
+            "atr":
+                float(atr),
+
+            "note":
+                "Research/paper-trading levels only. "
+                "No future price is guaranteed."
+        }
+
+    except Exception as e:
+
+        logger.error(
+            f"TP/SL error: {e}"
+        )
+
+        return {
+            "status": "ERROR",
+            "reason": str(e)
+        }
+
+
+# ============================================================
+# 2F — SESSION / KILLZONE FILTER
+# ============================================================
+
+def session_filter(hour_utc):
+
+    # Broad UTC research windows.
+    # Exact broker/session settings should be configurable later.
+
+    if 7 <= hour_utc < 11:
+
+        return {
+            "status": "ACTIVE",
+            "session": "LONDON",
+            "reason":
+                "London research window"
+        }
+
+    if 12 <= hour_utc < 16:
+
+        return {
+            "status": "ACTIVE",
+            "session": "NEW_YORK",
+            "reason":
+                "New York research window"
+        }
+
+    if 0 <= hour_utc < 7:
+
+        return {
+            "status": "LOW_ACTIVITY",
+            "session": "ASIAN_EARLY",
+            "reason":
+                "Lower activity window"
+        }
+
+    return {
+        "status": "LOW_ACTIVITY",
+        "session": "OTHER",
+        "reason":
+            "Potential low-liquidity period"
+    }
+
+
+# ============================================================
+# NEWS BLOCKER
+# ============================================================
+
+def check_high_impact_news(
+    news_events,
+    minutes_ahead=30
+):
+
+    """
+    news_events must come from a structured
+    economic-calendar source.
+
+    Example:
+
+    {
+        "title": "CPI",
+        "impact": "HIGH",
+        "minutes_to_event": 15
+    }
+    """
+
+    for event in news_events:
+
+        impact = str(
+            event.get(
+                "impact",
+                ""
+            )
+        ).upper()
+
+        try:
+
+            minutes = float(
+                event.get(
+                    "minutes_to_event",
+                    999999
+                )
+            )
+
+        except Exception:
+
+            minutes = 999999
+
+        if (
+            impact == "HIGH"
+            and 0 <= minutes <= minutes_ahead
+        ):
+
+            return True
+
+    return False
+
+
+# ============================================================
+# PREMIUM / DISCOUNT GATE
+# ============================================================
+
+def premium_discount_gate(
+    pd_zone,
+    structure
+):
+
+    zone = pd_zone.get(
+        "zone",
+        "UNKNOWN"
+    )
+
+    struct = structure.get(
+        "structure",
+        "UNKNOWN"
+    )
+
+    if zone == "UNKNOWN":
+
+        return {
+            "status": "UNKNOWN",
+            "reason":
+                "Premium/Discount unavailable"
+        }
+
+    if (
+        struct == "BULLISH_STRUCTURE"
+        and zone == "DISCOUNT"
+    ):
+
+        return {
+            "status": "PASS",
+            "reason":
+                "Bullish structure + discount"
+        }
+
+    if (
+        struct == "BEARISH_STRUCTURE"
+        and zone == "PREMIUM"
+    ):
+
+        return {
+            "status": "PASS",
+            "reason":
+                "Bearish structure + premium"
+        }
+
+    if struct in [
+        "BULLISH_STRUCTURE",
+        "BEARISH_STRUCTURE"
+    ]:
+
+        return {
+            "status": "CAUTION",
+            "reason":
+                "Structure and P/D are not ideally aligned"
+        }
+
+    return {
+        "status": "UNKNOWN",
+        "reason":
+            "Structure uncertain"
+    }
+
+
+# ============================================================
+# LIQUIDITY GATE
+# ============================================================
+
+def liquidity_gate(liquidity):
+
+    event = liquidity.get(
+        "event",
+        "NONE"
+    )
+
+    if event == "UNKNOWN":
+
+        return {
+            "status": "UNKNOWN",
+            "reason":
+                "Liquidity analysis unavailable"
+        }
+
+    if "SWEEP" in event:
+
+        return {
+            "status": "CAUTION",
+            "reason":
+                "Liquidity sweep detected; confirmation required"
+        }
+
+    if "BOS" in event:
+
+        return {
+            "status": "PASS",
+            "reason":
+                "Close-based structure break detected"
+        }
+
+    return {
+        "status": "WAIT",
+        "reason":
+            "No confirmed liquidity event"
+    }
+
+
+# ============================================================
+# FINAL PROTECTION GATE
+# ============================================================
+
+def protection_gate(
+    session,
+    news_blocked,
+    pd_gate,
+    liquidity_gate_result,
+    confluence
+):
+
+    reasons = []
+
+    # Session filter
+    if session["status"] != "ACTIVE":
+
+        reasons.append(
+            session["reason"]
+        )
+
+    # News filter
+    if news_blocked:
+
+        reasons.append(
+            "High-impact news risk"
+        )
+
+    # Premium/Discount
+    if pd_gate["status"] in [
+        "UNKNOWN",
+        "CAUTION"
+    ]:
+
+        reasons.append(
+            pd_gate["reason"]
+        )
+
+    # Liquidity
+    if liquidity_gate_result["status"] in [
+        "UNKNOWN",
+        "WAIT",
+        "CAUTION"
+    ]:
+
+        reasons.append(
+            liquidity_gate_result["reason"]
+        )
+
+    # Confluence
+    if confluence["score"] < 50:
+
+        reasons.append(
+            "Insufficient confluence"
+        )
+
+    if reasons:
+
+        return {
+            "status": "WAIT",
+            "reasons": reasons
+        }
+
+    return {
+        "status": "PASS",
+        "reasons": []
+    }
+
+
+# ============================================================
+# 2C + 2D + 2E + 2F MASTER ENGINE
+# ============================================================
+
+def run_market_research(
+    df,
+    technical_summary,
+    news_events=None
+):
+
+    try:
+
+        news_events = (
+            news_events
+            if news_events is not None
+            else []
+        )
+
+        # ====================================================
+        # 2C
+        # ====================================================
+
+        df = detect_swing_points(df)
+
+        structure = determine_structure(df)
+
+        liquidity = detect_liquidity_event(df)
+
+        fvg_list = detect_fvg(df)
+
+        order_blocks = detect_order_blocks(df)
+
+        pd_zone = premium_discount_analysis(df)
+
+        # ====================================================
+        # 2D
+        # ====================================================
+
+        confluence = build_confluence(
+            technical_summary,
+            structure,
+            liquidity,
+            pd_zone,
+            fvg_list,
+            order_blocks
+        )
+
+        scenarios = build_scenarios(
+            structure,
+            liquidity,
+            pd_zone
+        )
+
+        # ====================================================
+        # 2E
+        # ====================================================
+
+        tp_sl = calculate_research_tp_sl(
+            df,
+            structure
+        )
+
+        # ====================================================
+        # 2F
+        # ====================================================
+
+        now_utc = pd.Timestamp.now(
+            tz="UTC"
+        )
+
+        session = session_filter(
+            now_utc.hour
+        )
+
+        news_blocked = check_high_impact_news(
+            news_events,
+            minutes_ahead=30
+        )
+
+        pd_gate = premium_discount_gate(
+            pd_zone,
+            structure
+        )
+
+        liq_gate = liquidity_gate(
+            liquidity
+        )
+
+        final_gate = protection_gate(
+            session,
+            news_blocked,
+            pd_gate,
+            liq_gate,
+            confluence
+        )
+
+        # ====================================================
+        # FINAL RESULT
+        # ====================================================
+
+        return {
+
+            "status": "ANALYZED",
+
+            "timestamp_utc":
+                str(now_utc),
+
+            "structure":
+                structure,
+
+            "liquidity":
+                liquidity,
+
+            "fvg":
+                fvg_list,
+
+            "order_blocks":
+                order_blocks,
+
+            "premium_discount":
+                pd_zone,
+
+            "confluence":
+                confluence,
+
+            "scenarios":
+                scenarios,
+
+            "tp_sl":
+                tp_sl,
+
+            "protection": {
+
+                "session":
+                    session,
+
+                "news_blocked":
+                    news_blocked,
+
+                "premium_discount_gate":
+                    pd_gate,
+
+                "liquidity_gate":
+                    liq_gate,
+
+                "final":
+                    final_gate
+            }
+        }
+
+    except Exception as e:
+
+        logger.error(
+            f"Master research error: {e}"
+        )
+
+        return {
+            "status": "ERROR",
+            "reason": str(e)
+        }
+
+
+# ============================================================
+# HUMAN-READABLE RESEARCH REPORT
+# ============================================================
+
+def format_research_report(
+    symbol,
+    timeframe,
+    result
+):
+
+    try:
+
+        structure = result.get(
+            "structure",
+            {}
+        )
+
+        liquidity = result.get(
+            "liquidity",
+            {}
+        )
+
+        pd_zone = result.get(
+            "premium_discount",
+            {}
+        )
+
+        confluence = result.get(
+            "confluence",
+            {}
+        )
+
+        tp_sl = result.get(
+            "tp_sl",
+            {}
+        )
+
+        protection = result.get(
+            "protection",
+            {}
+        )
+
+        session = protection.get(
+            "session",
+            {}
+        )
+
+        final_gate = protection.get(
+            "final",
+            {}
+        )
+
+        lines = [
+
+            "━━━━━━━━━━━━━━━━━━━━",
+            "🔎 MARKET RESEARCH",
+            "━━━━━━━━━━━━━━━━━━━━",
+
+            f"Market: {symbol}",
+            f"Timeframe: {timeframe}",
+
+            "",
+
+            "📐 STRUCTURE",
+            f"• {structure.get('structure', 'UNKNOWN')}",
+
+            "",
+
+            "💧 LIQUIDITY",
+            f"• {liquidity.get('event', 'NONE')}",
+
+            "",
+
+            "📊 PREMIUM / DISCOUNT",
+            f"• {pd_zone.get('zone', 'UNKNOWN')}",
+
+            "",
+
+            "🧠 CONFLUENCE",
+            f"• Score: {confluence.get('score', 0)}/100",
+            f"• Status: {confluence.get('status', 'WAIT')}",
+
+            "",
+
+            "🛡 PROTECTION",
+            f"• Session: {session.get('session', 'UNKNOWN')}",
+            f"• Session status: {session.get('status', 'UNKNOWN')}",
+            f"• News blocked: {protection.get('news_blocked', False)}",
+
+            "",
+
+            "🚦 FINAL DECISION",
+            f"• {final_gate.get('status', 'WAIT')}"
+        ]
+
+        # ----------------------------------------
+        # Reasons
+        # ----------------------------------------
+
+        reasons = final_gate.get(
+            "reasons",
+            []
+        )
+
+        if reasons:
+
+            lines.append("")
+
+            lines.append(
+                "Reasons:"
+            )
+
+            for reason in reasons[:8]:
+
+                lines.append(
+                    f"• {reason}"
+                )
+
+        # ----------------------------------------
+        # Evidence
+        # ----------------------------------------
+
+        evidence = confluence.get(
+            "evidence",
+            []
+        )
+
+        if evidence:
+
+            lines.append("")
+
+            lines.append(
+                "✅ Evidence:"
+            )
+
+            for item in evidence[:8]:
+
+                lines.append(
+                    f"• {item}"
+                )
+
+        # ----------------------------------------
+        # Conflicts
+        # ----------------------------------------
+
+        conflicts = confluence.get(
+            "conflicts",
+            []
+        )
+
+        if conflicts:
+
+            lines.append("")
+
+            lines.append(
+                "⚠️ Conflicts:"
+            )
+
+            for item in conflicts[:8]:
+
+                lines.append(
+                    f"• {item}"
+                )
+
+        # ----------------------------------------
+        # TP / SL Research
+        # ----------------------------------------
+
+        if tp_sl.get("status") == "RESEARCH_ONLY":
+
+            lines.extend([
+
+                "",
+                "📍 RESEARCH LEVELS",
+
+                f"• Direction: "
+                f"{tp_sl.get('direction')}",
+
+                f"• Reference: "
+                f"{tp_sl.get('reference_price'):.6f}",
+
+                f"• Research SL: "
+                f"{tp_sl.get('research_sl'):.6f}"
+            ])
+
+            targets = tp_sl.get(
+                "targets",
+                {}
+            )
+
+            for name, value in targets.items():
+
+                lines.append(
+                    f"• {name}: {value:.6f}"
+                )
+
+        else:
+
+            lines.extend([
+
+                "",
+                "📍 RESEARCH LEVELS",
+                "• Not available / WAIT"
+            ])
+
+        lines.extend([
+
+            "",
+            "⚠️ Research / Paper Trading Only",
+            "No future price or outcome is guaranteed.",
+
+            "━━━━━━━━━━━━━━━━━━━━"
+        ])
+
+        return "\n".join(lines)
+
+    except Exception as e:
+
+        logger.error(
+            f"Report formatting error: {e}"
+        )
+
+        return (
+            "Research report unavailable."
+        )
+
+
+# ============================================================
+# END OF STEP 2C + 2D + 2E + 2F
+# ============================================================
