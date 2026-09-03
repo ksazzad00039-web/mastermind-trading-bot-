@@ -1,1 +1,11 @@
+python-telegram-bot
+google-genai
 flask
+python-dotenv
+
+pandas
+numpy
+requests
+aiohttp
+yfinance
+scipy
