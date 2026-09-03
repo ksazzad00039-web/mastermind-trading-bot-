@@ -1,136 +1,77 @@
 # ============================================================
-# MASTER MARKET RESEARCH BOT
-# STEP 2A + STEP 2B
+# MARKET RESEARCH TELEGRAM BOT
+# FINAL SINGLE-FILE VERSION
+# Research / Paper-Trading Only
 # ============================================================
 
 import os
+import re
+import math
 import logging
 import threading
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
 
-from flask import Flask
+from flask import Flask, jsonify
 
 from dotenv import load_dotenv
-
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-
 from telegram.ext import (
     Application,
+    ApplicationBuilder,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
 
-from google import genai
+# New Google GenAI SDK
+try:
+    from google import genai
+except Exception:
+    genai = None
 
 
 # ============================================================
-# ENVIRONMENT
+# 1. ENVIRONMENT
 # ============================================================
 
 load_dotenv()
 
-TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN"
-)
-
-GEMINI_API_KEY = os.getenv(
-    "GEMINI_API_KEY"
-)
-
-GEMINI_MODEL = os.getenv(
-    "GEMINI_MODEL",
-    "gemini-3.7-flash"
-)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.7-flash").strip()
 
 ALPHA_VANTAGE_API_KEY = os.getenv(
-    "ALPHA_VANTAGE_API_KEY"
-)
+    "ALPHA_VANTAGE_API_KEY", ""
+).strip()
 
-PORT = int(
-    os.getenv("PORT", "10000")
-)
+PORT = int(os.getenv("PORT", "10000"))
 
 
 # ============================================================
-# LOGGING
+# 2. LOGGING
 # ============================================================
 
 logging.basicConfig(
-    format=(
-        "%(asctime)s - "
-        "%(name)s - "
-        "%(levelname)s - "
-        "%(message)s"
-    ),
     level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 
-logger = logging.getLogger(
-    "MasterMarketBot"
-)
+logger = logging.getLogger("MarketResearchBot")
 
 
 # ============================================================
-# ENV VALIDATION
-# ============================================================
-
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError(
-        "TELEGRAM_BOT_TOKEN is missing."
-    )
-
-if not GEMINI_API_KEY:
-    logger.warning(
-        "GEMINI_API_KEY is missing. "
-        "AI Chat will be unavailable."
-    )
-
-if not ALPHA_VANTAGE_API_KEY:
-    logger.warning(
-        "ALPHA_VANTAGE_API_KEY is missing. "
-        "News engine will be unavailable."
-    )
-
-
-# ============================================================
-# GEMINI
-# ============================================================
-
-gemini_client = None
-
-if GEMINI_API_KEY:
-
-    try:
-
-        gemini_client = genai.Client(
-            api_key=GEMINI_API_KEY
-        )
-
-        logger.info(
-            "Gemini client initialized."
-        )
-
-    except Exception as error:
-
-        logger.exception(
-            "Gemini initialization failed: %s",
-            error
-        )
-
-
-# ============================================================
-# FLASK HEALTH SERVER
+# 3. FLASK HEALTH SERVER
 # ============================================================
 
 flask_app = Flask(__name__)
@@ -138,163 +79,229 @@ flask_app = Flask(__name__)
 
 @flask_app.route("/")
 def home():
-
-    return (
-        "Master Market Research Bot "
-        "is running."
-    )
+    return jsonify({
+        "status": "online",
+        "bot": "Market Research Bot",
+        "mode": "research/paper",
+        "time_utc": datetime.now(timezone.utc).isoformat(),
+    })
 
 
 @flask_app.route("/health")
 def health():
-
-    return {
-        "status": "online",
-        "telegram": bool(
-            TELEGRAM_BOT_TOKEN
-        ),
-        "gemini": bool(
-            gemini_client
-        ),
-        "alpha_vantage": bool(
-            ALPHA_VANTAGE_API_KEY
-        ),
-        "market_data": "Yahoo Finance",
-        "trading_execution": "DISABLED",
-    }
+    return jsonify({
+        "status": "healthy",
+        "telegram_configured": bool(TELEGRAM_BOT_TOKEN),
+        "gemini_configured": bool(GEMINI_API_KEY),
+        "alpha_vantage_configured": bool(ALPHA_VANTAGE_API_KEY),
+        "time_utc": datetime.now(timezone.utc).isoformat(),
+    })
 
 
 def run_flask():
-
-    flask_app.run(
-        host="0.0.0.0",
-        port=PORT,
-        use_reloader=False,
-    )
+    try:
+        flask_app.run(
+            host="0.0.0.0",
+            port=PORT,
+            use_reloader=False,
+        )
+    except Exception:
+        logger.exception("Flask server stopped.")
 
 
 # ============================================================
-# SYMBOL MAP
+# 4. GEMINI
+# ============================================================
+
+gemini_client = None
+
+if GEMINI_API_KEY and genai is not None:
+    try:
+        gemini_client = genai.Client(
+            api_key=GEMINI_API_KEY
+        )
+        logger.info("Gemini client initialized.")
+    except Exception:
+        logger.exception("Gemini initialization failed.")
+
+
+# ============================================================
+# 5. SYMBOL MAP
 # ============================================================
 
 SYMBOL_MAP = {
 
+    # Forex
     "EURUSD": "EURUSD=X",
+    "EUR/USD": "EURUSD=X",
 
     "GBPUSD": "GBPUSD=X",
-
-    "USDJPY": "JPY=X",
-
-    "USDCHF": "CHF=X",
+    "GBP/USD": "GBPUSD=X",
 
     "AUDUSD": "AUDUSD=X",
-
-    "USDCAD": "CAD=X",
+    "AUD/USD": "AUDUSD=X",
 
     "NZDUSD": "NZDUSD=X",
+    "NZD/USD": "NZDUSD=X",
 
-    "XAUUSD": "GC=F",
+    "USDJPY": "JPY=X",
+    "USD/JPY": "JPY=X",
 
+    "USDCHF": "CHF=X",
+    "USD/CHF": "CHF=X",
+
+    "USDCAD": "CAD=X",
+    "USD/CAD": "CAD=X",
+
+    # Gold
     "GOLD": "GC=F",
+    "XAUUSD": "GC=F",
+    "XAU/USD": "GC=F",
 
+    # Crypto
     "BTCUSD": "BTC-USD",
+    "BTC/USD": "BTC-USD",
 
     "ETHUSD": "ETH-USD",
+    "ETH/USD": "ETH-USD",
+}
+
+
+DISPLAY_NAMES = {
+    "EURUSD": "EUR/USD",
+    "GBPUSD": "GBP/USD",
+    "AUDUSD": "AUD/USD",
+    "NZDUSD": "NZD/USD",
+    "USDJPY": "USD/JPY",
+    "USDCHF": "USD/CHF",
+    "USDCAD": "USD/CAD",
+    "GOLD": "Gold / XAUUSD",
+    "XAUUSD": "Gold / XAUUSD",
+    "BTCUSD": "Bitcoin / BTCUSD",
+    "ETHUSD": "Ethereum / ETHUSD",
 }
 
 
 WATCHLIST = [
     "EURUSD",
     "GBPUSD",
+    "AUDUSD",
+    "NZDUSD",
     "USDJPY",
     "USDCHF",
-    "AUDUSD",
     "USDCAD",
-    "NZDUSD",
-    "XAUUSD",
+    "GOLD",
     "BTCUSD",
     "ETHUSD",
 ]
 
 
 # ============================================================
-# DATA VALIDATION
+# 6. TIMEFRAMES
 # ============================================================
 
-def validate_dataframe(df):
+TIMEFRAMES = {
+    "5m":  ("5d", "5m"),
+    "15m": ("5d", "15m"),
+    "30m": ("1mo", "30m"),
+    "1h":  ("1mo", "1h"),
+    "2h":  ("3mo", "1h"),
+    "4h":  ("6mo", "1h"),
+    "1D":  ("2y", "1d"),
+}
 
+
+# ============================================================
+# 7. DATA HELPERS
+# ============================================================
+
+def normalize_symbol(text: str):
+    if not text:
+        return None
+
+    value = text.upper().strip()
+    value = re.sub(r"\s+", "", value)
+
+    return value
+
+
+def resolve_symbol(symbol: str):
+    normalized = normalize_symbol(symbol)
+
+    if normalized in SYMBOL_MAP:
+        return normalized, SYMBOL_MAP[normalized]
+
+    return None, None
+
+
+def validate_dataframe(df):
     if df is None:
-        return False, "DATA_IS_NONE"
+        return False, "No dataframe returned."
 
     if df.empty:
-        return False, "EMPTY_DATA"
+        return False, "Market data is empty."
 
-    required_columns = [
-        "Open",
-        "High",
-        "Low",
-        "Close",
-    ]
+    required = ["Open", "High", "Low", "Close"]
 
     missing = [
-        column
-        for column in required_columns
-        if column not in df.columns
+        col for col in required
+        if col not in df.columns
     ]
 
     if missing:
+        return False, f"Missing columns: {missing}"
 
-        return (
-            False,
-            "MISSING_COLUMNS: "
-            + ",".join(missing)
+    df = df.copy()
+
+    for col in required:
+        df[col] = pd.to_numeric(
+            df[col],
+            errors="coerce"
         )
 
-    data = df[
-        required_columns
-    ].copy()
+    df = df.dropna(
+        subset=required
+    )
 
-    if data.isnull().all().any():
-
-        return False, "INVALID_NULL_DATA"
-
-    if len(data) < 20:
-
-        return (
-            False,
-            "INSUFFICIENT_DATA"
+    if len(df) < 60:
+        return False, (
+            f"Not enough candles. "
+            f"Received {len(df)}, need at least 60."
         )
+
+    if df.index.has_duplicates:
+        df = df[
+            ~df.index.duplicated(
+                keep="last"
+            )
+        ]
 
     return True, "OK"
 
 
-# ============================================================
-# MARKET DATA ENGINE
-# ============================================================
-
 def get_market_data(
-    symbol,
-    period="5d",
-    interval="1h",
+    symbol: str,
+    period="1mo",
+    interval="1h"
 ):
+    display_symbol, yf_symbol = resolve_symbol(symbol)
 
-    symbol = symbol.upper().strip()
-
-    yahoo_symbol = SYMBOL_MAP.get(
-        symbol
-    )
-
-    if not yahoo_symbol:
-
-        return {
-            "status": "UNKNOWN_SYMBOL",
-            "symbol": symbol,
-        }
+    if not yf_symbol:
+        return None, (
+            f"Unknown symbol: {symbol}"
+        )
 
     try:
+        logger.info(
+            "Downloading %s -> %s | %s | %s",
+            display_symbol,
+            yf_symbol,
+            period,
+            interval,
+        )
 
         df = yf.download(
-            yahoo_symbol,
+            yf_symbol,
             period=period,
             interval=interval,
             progress=False,
@@ -302,383 +309,102 @@ def get_market_data(
             threads=False,
         )
 
-        if isinstance(
-            df.columns,
-            pd.MultiIndex
-        ):
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
 
-            df.columns = [
-                column[0]
-                for column in df.columns
-            ]
-
-        valid, reason = (
-            validate_dataframe(df)
-        )
+        valid, message = validate_dataframe(df)
 
         if not valid:
+            logger.warning(
+                "Data validation failed: %s",
+                message,
+            )
+            return None, message
 
-            return {
-                "status": "DATA_UNAVAILABLE",
-                "symbol": symbol,
-                "reason": reason,
-            }
+        return df, "OK"
 
-        latest = df.iloc[-1]
-
-        timestamp = str(
-            df.index[-1]
-        )
-
-        return {
-
-            "status": "DATA_RECEIVED",
-
-            "symbol": symbol,
-
-            "yahoo_symbol": yahoo_symbol,
-
-            "price": float(
-                latest["Close"]
-            ),
-
-            "open": float(
-                latest["Open"]
-            ),
-
-            "high": float(
-                latest["High"]
-            ),
-
-            "low": float(
-                latest["Low"]
-            ),
-
-            "timestamp": timestamp,
-
-            "rows": len(df),
-
-            "source": (
-                "Yahoo Finance"
-            ),
-        }
-
-    except Exception as error:
-
+    except Exception as e:
         logger.exception(
-            "Market data error: %s",
-            error
+            "Market data error."
         )
-
-        return {
-            "status": "ERROR",
-            "symbol": symbol,
-            "reason": str(error),
-        }
+        return None, str(e)
 
 
 # ============================================================
-# PRICE FORMATTER
-# ============================================================
-
-def format_price(data):
-
-    if data["status"] != "DATA_RECEIVED":
-
-        return (
-            f"❌ Data unavailable\n\n"
-            f"Symbol: "
-            f"{data.get('symbol')}\n"
-            f"Reason: "
-            f"{data.get('reason', 'Unknown')}"
-        )
-
-    return (
-        "📊 *MARKET DATA*\n\n"
-        f"Symbol: `{data['symbol']}`\n"
-        f"Price: `{data['price']}`\n"
-        f"Open: `{data['open']}`\n"
-        f"High: `{data['high']}`\n"
-        f"Low: `{data['low']}`\n"
-        f"Time: `{data['timestamp']}`\n"
-        f"Rows: `{data['rows']}`\n"
-        f"Source: `{data['source']}`\n\n"
-        "⚠️ This is research data and "
-        "may not match an OTC broker feed."
-    )
-
-
-# ============================================================
-# NEWS ENGINE
-# ============================================================
-
-def get_news(
-    query="forex",
-    limit=5,
-):
-
-    if not ALPHA_VANTAGE_API_KEY:
-
-        return {
-            "status": "NEWS_UNAVAILABLE",
-            "reason": (
-                "ALPHA_VANTAGE_API_KEY missing"
-            ),
-            "articles": [],
-        }
-
-    try:
-
-        url = (
-            "https://www.alphavantage.co/"
-            "query"
-        )
-
-        params = {
-
-            "function":
-                "NEWS_SENTIMENT",
-
-            "apikey":
-                ALPHA_VANTAGE_API_KEY,
-
-            "topics":
-                query,
-
-            "sort":
-                "LATEST",
-
-            "limit":
-                limit,
-        }
-
-        response = requests.get(
-            url,
-            params=params,
-            timeout=20,
-        )
-
-        response.raise_for_status()
-
-        payload = response.json()
-
-        if "feed" not in payload:
-
-            return {
-                "status":
-                    "NEWS_UNAVAILABLE",
-                "reason":
-                    payload.get(
-                        "Information",
-                        payload.get(
-                            "Note",
-                            "No news feed"
-                        )
-                    ),
-                "articles": [],
-            }
-
-        articles = []
-
-        for item in payload["feed"]:
-
-            articles.append({
-
-                "title":
-                    item.get(
-                        "title",
-                        "Untitled"
-                    ),
-
-                "source":
-                    item.get(
-                        "source",
-                        "Unknown"
-                    ),
-
-                "published":
-                    item.get(
-                        "time_published",
-                        "Unknown"
-                    ),
-
-                "url":
-                    item.get(
-                        "url",
-                        ""
-                    ),
-            })
-
-        return {
-
-            "status":
-                "NEWS_RECEIVED",
-
-            "articles":
-                articles,
-        }
-
-    except Exception as error:
-
-        logger.exception(
-            "News error: %s",
-            error
-        )
-
-        return {
-
-            "status":
-                "NEWS_ERROR",
-
-            "reason":
-                str(error),
-
-            "articles":
-                [],
-        }
-
-
-def format_news(data):
-
-    if data["status"] != "NEWS_RECEIVED":
-
-        return (
-            "📰 *NEWS ENGINE*\n\n"
-            "❌ News unavailable.\n"
-            f"Reason: "
-            f"{data.get('reason', 'Unknown')}"
-        )
-
-    text = (
-        "📰 *LATEST MARKET NEWS*\n\n"
-    )
-
-    for index, article in enumerate(
-        data["articles"],
-        start=1
-    ):
-
-        text += (
-            f"*{index}. "
-            f"{article['title']}*\n"
-            f"Source: "
-            f"{article['source']}\n"
-            f"Published: "
-            f"{article['published']}\n\n"
-        )
-
-    return text
-
-
-# ============================================================
-# TECHNICAL INDICATORS
+# 8. INDICATORS
 # ============================================================
 
 def calculate_indicators(df):
+    df = df.copy()
 
     try:
+        close = df["Close"]
+        high = df["High"]
+        low = df["Low"]
 
-        data = df.copy()
-
-        close = data["Close"].astype(
-            float
-        )
-
-        high = data["High"].astype(
-            float
-        )
-
-        low = data["Low"].astype(
-            float
-        )
-
-        # ----------------------------------------------------
         # EMA
-        # ----------------------------------------------------
-
-        data["EMA_20"] = (
+        df["EMA_20"] = (
             close.ewm(
                 span=20,
                 adjust=False
             ).mean()
         )
 
-        data["EMA_50"] = (
+        df["EMA_50"] = (
             close.ewm(
                 span=50,
                 adjust=False
             ).mean()
         )
 
-        data["EMA_200"] = (
+        df["EMA_200"] = (
             close.ewm(
                 span=200,
                 adjust=False
             ).mean()
         )
 
-        # ----------------------------------------------------
         # SMA
-        # ----------------------------------------------------
-
-        data["SMA_20"] = (
+        df["SMA_20"] = (
             close.rolling(20).mean()
         )
 
-        data["SMA_50"] = (
+        df["SMA_50"] = (
             close.rolling(50).mean()
         )
 
-        data["SMA_200"] = (
+        df["SMA_200"] = (
             close.rolling(200).mean()
         )
 
-        # ----------------------------------------------------
-        # RSI 14 — Wilder style
-        # ----------------------------------------------------
-
+        # RSI - Wilder style
         delta = close.diff()
 
-        gain = delta.clip(
-            lower=0
-        )
-
-        loss = -delta.clip(
-            upper=0
-        )
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
 
         avg_gain = gain.ewm(
             alpha=1 / 14,
-            adjust=False,
-            min_periods=14
+            adjust=False
         ).mean()
 
         avg_loss = loss.ewm(
             alpha=1 / 14,
-            adjust=False,
-            min_periods=14
+            adjust=False
         ).mean()
 
-        rs = (
-            avg_gain
-            / avg_loss.replace(
-                0,
-                np.nan
+        rs = avg_gain / avg_loss.replace(
+            0,
+            np.nan
+        )
+
+        df["RSI"] = (
+            100 - (
+                100 / (1 + rs)
             )
         )
 
-        data["RSI_14"] = (
-            100
-            - (
-                100
-                / (1 + rs)
-            )
-        )
-
-        # ----------------------------------------------------
         # MACD
-        # ----------------------------------------------------
-
         ema12 = close.ewm(
             span=12,
             adjust=False
@@ -689,12 +415,10 @@ def calculate_indicators(df):
             adjust=False
         ).mean()
 
-        data["MACD"] = (
-            ema12 - ema26
-        )
+        df["MACD"] = ema12 - ema26
 
-        data["MACD_SIGNAL"] = (
-            data["MACD"]
+        df["MACD_SIGNAL"] = (
+            df["MACD"]
             .ewm(
                 span=9,
                 adjust=False
@@ -702,808 +426,1688 @@ def calculate_indicators(df):
             .mean()
         )
 
-        data["MACD_HIST"] = (
-            data["MACD"]
-            - data["MACD_SIGNAL"]
+        df["MACD_HIST"] = (
+            df["MACD"]
+            - df["MACD_SIGNAL"]
         )
 
-        # ----------------------------------------------------
         # Bollinger Bands
-        # ----------------------------------------------------
+        bb_mid = close.rolling(20).mean()
+        bb_std = close.rolling(20).std()
 
-        bb_middle = (
-            close.rolling(20).mean()
+        df["BB_MID"] = bb_mid
+        df["BB_UPPER"] = (
+            bb_mid + 2 * bb_std
+        )
+        df["BB_LOWER"] = (
+            bb_mid - 2 * bb_std
         )
 
-        bb_std = (
-            close.rolling(20).std()
-        )
-
-        data["BB_MIDDLE"] = (
-            bb_middle
-        )
-
-        data["BB_UPPER"] = (
-            bb_middle
-            + (2 * bb_std)
-        )
-
-        data["BB_LOWER"] = (
-            bb_middle
-            - (2 * bb_std)
-        )
-
-        data["BB_WIDTH"] = (
-            data["BB_UPPER"]
-            - data["BB_LOWER"]
-        )
-
-        # ----------------------------------------------------
         # ATR
-        # ----------------------------------------------------
-
-        previous_close = close.shift(
-            1
-        )
+        prev_close = close.shift(1)
 
         tr1 = high - low
-
         tr2 = (
-            high - previous_close
+            high - prev_close
         ).abs()
 
         tr3 = (
-            low - previous_close
+            low - prev_close
         ).abs()
 
         true_range = pd.concat(
-            [
-                tr1,
-                tr2,
-                tr3,
-            ],
+            [tr1, tr2, tr3],
             axis=1
         ).max(axis=1)
 
-        data["ATR_14"] = (
-            true_range.ewm(
+        df["TR"] = true_range
+
+        df["ATR"] = (
+            true_range
+            .ewm(
                 alpha=1 / 14,
-                adjust=False,
-                min_periods=14
-            ).mean()
+                adjust=False
+            )
+            .mean()
         )
 
-        # ----------------------------------------------------
-        # ATR %
-        # ----------------------------------------------------
-
-        data["ATR_PERCENT"] = (
-            data["ATR_14"]
-            / close
+        df["ATR_PCT"] = (
+            df["ATR"] / close
         ) * 100
 
-        # ----------------------------------------------------
-        # Volatility
-        # ----------------------------------------------------
+        # Returns / volatility
+        df["RETURN"] = close.pct_change()
 
-        returns = close.pct_change()
-
-        data["VOLATILITY_20"] = (
-            returns.rolling(20).std()
+        df["VOLATILITY"] = (
+            df["RETURN"]
+            .rolling(20)
+            .std()
             * np.sqrt(20)
+            * 100
         )
 
-        # ----------------------------------------------------
-        # Remove invalid numeric values
-        # ----------------------------------------------------
+        # Candle statistics
+        df["BODY"] = (
+            df["Close"]
+            - df["Open"]
+        ).abs()
 
-        data.replace(
-            [np.inf, -np.inf],
-            np.nan,
-            inplace=True
+        df["RANGE"] = (
+            df["High"]
+            - df["Low"]
         )
 
-        return data
+        df["UPPER_WICK"] = (
+            df["High"]
+            - df[
+                ["Open", "Close"]
+            ].max(axis=1)
+        )
 
-    except Exception as error:
-
-        logger.exception(
-            "Indicator error: %s",
-            error
+        df["LOWER_WICK"] = (
+            df[
+                ["Open", "Close"]
+            ].min(axis=1)
+            - df["Low"]
         )
 
         return df
 
-
-# ============================================================
-# TREND STRENGTH
-# ============================================================
-
-def calculate_trend_strength(df):
-
-    try:
-
-        if len(df) < 50:
-
-            return {
-                "status":
-                    "INSUFFICIENT_DATA",
-
-                "score":
-                    0,
-
-                "direction":
-                    "UNKNOWN",
-            }
-
-        row = df.iloc[-1]
-
-        score = 0
-
-        ema20 = row.get(
-            "EMA_20"
-        )
-
-        ema50 = row.get(
-            "EMA_50"
-        )
-
-        ema200 = row.get(
-            "EMA_200"
-        )
-
-        rsi = row.get(
-            "RSI_14"
-        )
-
-        macd = row.get(
-            "MACD"
-        )
-
-        macd_signal = row.get(
-            "MACD_SIGNAL"
-        )
-
-        # EMA 20/50
-
-        if (
-            pd.notna(ema20)
-            and pd.notna(ema50)
-        ):
-
-            if ema20 > ema50:
-                score += 1
-
-            elif ema20 < ema50:
-                score -= 1
-
-        # EMA 50/200
-
-        if (
-            pd.notna(ema50)
-            and pd.notna(ema200)
-        ):
-
-            if ema50 > ema200:
-                score += 1
-
-            elif ema50 < ema200:
-                score -= 1
-
-        # RSI
-
-        if pd.notna(rsi):
-
-            if rsi > 55:
-                score += 1
-
-            elif rsi < 45:
-                score -= 1
-
-        # MACD
-
-        if (
-            pd.notna(macd)
-            and pd.notna(macd_signal)
-        ):
-
-            if macd > macd_signal:
-                score += 1
-
-            elif macd < macd_signal:
-                score -= 1
-
-        if score >= 3:
-
-            direction = "BULLISH"
-
-        elif score <= -3:
-
-            direction = "BEARISH"
-
-        else:
-
-            direction = "NEUTRAL"
-
-        return {
-
-            "status":
-                "OK",
-
-            "score":
-                score,
-
-            "direction":
-                direction,
-        }
-
-    except Exception as error:
-
+    except Exception as e:
         logger.exception(
-            "Trend error: %s",
-            error
+            "Indicator calculation error."
         )
-
-        return {
-
-            "status":
-                "ERROR",
-
-            "score":
-                0,
-
-            "direction":
-                "UNKNOWN",
-        }
+        return df
 
 
 # ============================================================
-# MARKET REGIME
+# 9. MARKET REGIME
 # ============================================================
 
 def determine_market_regime(df):
 
     try:
-
         if len(df) < 50:
-
-            return {
-
-                "regime":
-                    "UNKNOWN",
-
-                "reason":
-                    "INSUFFICIENT_DATA",
-            }
+            return "UNKNOWN_REGIME"
 
         row = df.iloc[-1]
 
-        close = row.get(
-            "Close"
-        )
-
         ema20 = row.get(
-            "EMA_20"
+            "EMA_20",
+            np.nan
         )
 
         ema50 = row.get(
-            "EMA_50"
+            "EMA_50",
+            np.nan
         )
 
         rsi = row.get(
-            "RSI_14"
+            "RSI",
+            np.nan
         )
 
-        atr_percent = row.get(
-            "ATR_PERCENT"
+        atr_pct = row.get(
+            "ATR_PCT",
+            np.nan
         )
 
         if any(
-            pd.isna(value)
-            for value in [
-                close,
+            pd.isna(x)
+            for x in [
                 ema20,
                 ema50,
                 rsi,
+                atr_pct,
             ]
         ):
+            return "UNKNOWN_REGIME"
 
-            return {
-
-                "regime":
-                    "UNKNOWN",
-
-                "reason":
-                    "MISSING_INDICATOR_DATA",
-            }
-
-        trend_score = 0
-
-        if ema20 > ema50:
-
-            trend_score += 1
-
-        elif ema20 < ema50:
-
-            trend_score -= 1
-
-        if rsi > 55:
-
-            trend_score += 1
-
-        elif rsi < 45:
-
-            trend_score -= 1
-
-        # ----------------------------------------------------
-        # Regime
-        # ----------------------------------------------------
+        if atr_pct > 1.5:
+            volatility_state = (
+                "HIGH_VOLATILITY"
+            )
+        else:
+            volatility_state = (
+                "NORMAL_VOLATILITY"
+            )
 
         if (
-            45 <= rsi <= 55
-            and abs(trend_score) <= 1
+            ema20 > ema50
+            and rsi >= 55
+        ):
+            return (
+                "BULLISH_TRENDING | "
+                + volatility_state
+            )
+
+        if (
+            ema20 < ema50
+            and rsi <= 45
+        ):
+            return (
+                "BEARISH_TRENDING | "
+                + volatility_state
+            )
+
+        return (
+            "SIDEWAYS_RANGE | "
+            + volatility_state
+        )
+
+    except Exception:
+        logger.exception(
+            "Regime calculation error."
+        )
+        return "UNKNOWN_REGIME"
+
+
+# ============================================================
+# 10. SWING DETECTION
+# ============================================================
+
+def detect_swing_points(
+    df,
+    lookback=3
+):
+    df = df.copy()
+
+    df["SWING_HIGH"] = False
+    df["SWING_LOW"] = False
+
+    try:
+        for i in range(
+            lookback,
+            len(df) - lookback
         ):
 
-            regime = "RANGING"
+            current_high = df["High"].iloc[i]
+            current_low = df["Low"].iloc[i]
 
-        elif trend_score >= 2:
+            left_highs = df[
+                "High"
+            ].iloc[
+                i - lookback:i
+            ]
 
-            regime = "BULLISH_TREND"
+            right_highs = df[
+                "High"
+            ].iloc[
+                i + 1:i + 1 + lookback
+            ]
 
-        elif trend_score <= -2:
+            left_lows = df[
+                "Low"
+            ].iloc[
+                i - lookback:i
+            ]
 
-            regime = "BEARISH_TREND"
+            right_lows = df[
+                "Low"
+            ].iloc[
+                i + 1:i + 1 + lookback
+            ]
 
-        else:
+            if (
+                current_high > left_highs.max()
+                and current_high > right_highs.max()
+            ):
+                df.iloc[
+                    i,
+                    df.columns.get_loc(
+                        "SWING_HIGH"
+                    )
+                ] = True
 
-            regime = "TRANSITION"
+            if (
+                current_low < left_lows.min()
+                and current_low < right_lows.min()
+            ):
+                df.iloc[
+                    i,
+                    df.columns.get_loc(
+                        "SWING_LOW"
+                    )
+                ] = True
 
-        # ----------------------------------------------------
-        # Volatility
-        # ----------------------------------------------------
+        return df
 
-        volatility = "NORMAL"
+    except Exception:
+        logger.exception(
+            "Swing detection error."
+        )
+        return df
 
-        if pd.notna(
-            atr_percent
-        ):
 
-            if atr_percent > 2:
+# ============================================================
+# 11. MARKET STRUCTURE
+# ============================================================
 
-                volatility = "HIGH"
+def determine_structure(df):
 
-            elif atr_percent < 0.5:
+    try:
+        swing_highs = df[
+            df["SWING_HIGH"]
+        ]
 
-                volatility = "LOW"
+        swing_lows = df[
+            df["SWING_LOW"]
+        ]
+
+        high_values = (
+            swing_highs["High"]
+            .tail(4)
+            .tolist()
+        )
+
+        low_values = (
+            swing_lows["Low"]
+            .tail(4)
+            .tolist()
+        )
+
+        structure = "UNKNOWN"
+
+        if len(high_values) >= 2:
+            if (
+                high_values[-1]
+                > high_values[-2]
+            ):
+                structure = "HH"
+            else:
+                structure = "LH"
+
+        if len(low_values) >= 2:
+            if (
+                low_values[-1]
+                > low_values[-2]
+            ):
+                if structure == "HH":
+                    structure = "HH + HL"
+                else:
+                    structure = "HL"
+            else:
+                if structure == "LH":
+                    structure = "LH + LL"
+                else:
+                    structure = "LL"
 
         return {
-
-            "regime":
-                regime,
-
-            "volatility":
-                volatility,
-
-            "trend_score":
-                trend_score,
+            "structure": structure,
+            "recent_swing_high": (
+                high_values[-1]
+                if high_values
+                else None
+            ),
+            "previous_swing_high": (
+                high_values[-2]
+                if len(high_values) >= 2
+                else None
+            ),
+            "recent_swing_low": (
+                low_values[-1]
+                if low_values
+                else None
+            ),
+            "previous_swing_low": (
+                low_values[-2]
+                if len(low_values) >= 2
+                else None
+            ),
         }
 
-    except Exception as error:
-
+    except Exception:
         logger.exception(
-            "Regime error: %s",
-            error
+            "Structure error."
         )
 
         return {
-
-            "regime":
-                "UNKNOWN",
-
-            "reason":
-                "CALCULATION_ERROR",
+            "structure": "UNKNOWN"
         }
 
 
 # ============================================================
-# MULTI-TIMEFRAME CONFIG
+# 12. LIQUIDITY / BOS RESEARCH
 # ============================================================
 
-TIMEFRAMES = {
+def detect_liquidity_event(df):
 
-    "1m": {
-        "period": "1d",
-        "interval": "1m",
-    },
+    try:
+        if len(df) < 5:
+            return {
+                "event": "UNKNOWN"
+            }
 
-    "5m": {
-        "period": "5d",
-        "interval": "5m",
-    },
+        last = df.iloc[-1]
 
-    "15m": {
-        "period": "5d",
-        "interval": "15m",
-    },
+        recent_high = (
+            df["High"]
+            .iloc[-6:-1]
+            .max()
+        )
 
-    "30m": {
-        "period": "1mo",
-        "interval": "30m",
-    },
+        recent_low = (
+            df["Low"]
+            .iloc[-6:-1]
+            .min()
+        )
 
-    "1h": {
-        "period": "1mo",
-        "interval": "1h",
-    },
+        # Sweep above high, close back below
+        if (
+            last["High"] > recent_high
+            and last["Close"] < recent_high
+        ):
+            return {
+                "event": "BUY_SIDE_LIQUIDITY_SWEEP",
+                "level": float(recent_high),
+            }
 
-    "2h": {
-        "period": "3mo",
-        "interval": "2h",
-    },
+        # Sweep below low, close back above
+        if (
+            last["Low"] < recent_low
+            and last["Close"] > recent_low
+        ):
+            return {
+                "event": "SELL_SIDE_LIQUIDITY_SWEEP",
+                "level": float(recent_low),
+            }
 
-    "4h": {
-        "period": "6mo",
-        "interval": "4h",
-    },
+        # Genuine close above
+        if last["Close"] > recent_high:
+            return {
+                "event": "POTENTIAL_BULLISH_BOS",
+                "level": float(recent_high),
+            }
 
-    "1D": {
-        "period": "2y",
-        "interval": "1d",
-    },
-}
+        # Genuine close below
+        if last["Close"] < recent_low:
+            return {
+                "event": "POTENTIAL_BEARISH_BOS",
+                "level": float(recent_low),
+            }
+
+        return {
+            "event": "NO_CLEAR_LIQUIDITY_EVENT"
+        }
+
+    except Exception:
+        logger.exception(
+            "Liquidity detection error."
+        )
+
+        return {
+            "event": "UNKNOWN"
+        }
 
 
 # ============================================================
-# SINGLE TIMEFRAME ANALYSIS
+# 13. FAIR VALUE GAP
+# ============================================================
+
+def detect_fvg(df):
+
+    results = []
+
+    try:
+        start = max(2, len(df) - 30)
+
+        for i in range(
+            start,
+            len(df)
+        ):
+
+            c1_high = df[
+                "High"
+            ].iloc[i - 2]
+
+            c1_low = df[
+                "Low"
+            ].iloc[i - 2]
+
+            c3_high = df[
+                "High"
+            ].iloc[i]
+
+            c3_low = df[
+                "Low"
+            ].iloc[i]
+
+            # Bullish FVG
+            if c3_low > c1_high:
+
+                results.append({
+                    "type": "BULLISH_FVG",
+                    "low": float(c1_high),
+                    "high": float(c3_low),
+                    "index": i,
+                })
+
+            # Bearish FVG
+            if c3_high < c1_low:
+
+                results.append({
+                    "type": "BEARISH_FVG",
+                    "low": float(c3_high),
+                    "high": float(c1_low),
+                    "index": i,
+                })
+
+        return results[-5:]
+
+    except Exception:
+        logger.exception(
+            "FVG detection error."
+        )
+        return []
+
+
+# ============================================================
+# 14. ORDER BLOCK RESEARCH
+# ============================================================
+
+def detect_order_blocks(df):
+
+    results = []
+
+    try:
+        for i in range(
+            max(1, len(df) - 30),
+            len(df)
+        ):
+
+            previous = df.iloc[i - 1]
+            current = df.iloc[i]
+
+            # Previous bearish candle,
+            # current bullish displacement
+            if (
+                previous["Close"]
+                < previous["Open"]
+                and current["Close"]
+                > previous["High"]
+            ):
+                results.append({
+                    "type": "BULLISH_OB",
+                    "low": float(previous["Low"]),
+                    "high": float(previous["High"]),
+                    "index": i - 1,
+                })
+
+            # Previous bullish candle,
+            # current bearish displacement
+            elif (
+                previous["Close"]
+                > previous["Open"]
+                and current["Close"]
+                < previous["Low"]
+            ):
+                results.append({
+                    "type": "BEARISH_OB",
+                    "low": float(previous["Low"]),
+                    "high": float(previous["High"]),
+                    "index": i - 1,
+                })
+
+        return results[-5:]
+
+    except Exception:
+        logger.exception(
+            "Order block error."
+        )
+        return []
+
+
+# ============================================================
+# 15. PREMIUM / DISCOUNT
+# ============================================================
+
+def premium_discount_analysis(df):
+
+    try:
+        structure = determine_structure(df)
+
+        high = structure.get(
+            "recent_swing_high"
+        )
+
+        low = structure.get(
+            "recent_swing_low"
+        )
+
+        if high is None or low is None:
+            return {
+                "zone": "UNKNOWN",
+                "midpoint": None,
+            }
+
+        if high <= low:
+            return {
+                "zone": "UNKNOWN",
+                "midpoint": None,
+            }
+
+        midpoint = (
+            high + low
+        ) / 2
+
+        price = float(
+            df["Close"].iloc[-1]
+        )
+
+        if price > midpoint:
+            zone = "PREMIUM"
+        elif price < midpoint:
+            zone = "DISCOUNT"
+        else:
+            zone = "EQUILIBRIUM"
+
+        return {
+            "zone": zone,
+            "midpoint": float(midpoint),
+            "swing_high": float(high),
+            "swing_low": float(low),
+            "price": price,
+        }
+
+    except Exception:
+        logger.exception(
+            "Premium/Discount error."
+        )
+
+        return {
+            "zone": "UNKNOWN"
+        }
+
+
+# ============================================================
+# 16. TECHNICAL SUMMARY
+# ============================================================
+
+def technical_summary(df):
+
+    try:
+        row = df.iloc[-1]
+
+        return {
+            "price": float(
+                row["Close"]
+            ),
+
+            "EMA20": float(
+                row["EMA_20"]
+            ),
+
+            "EMA50": float(
+                row["EMA_50"]
+            ),
+
+            "EMA200": (
+                float(row["EMA_200"])
+                if not pd.isna(
+                    row["EMA_200"]
+                )
+                else None
+            ),
+
+            "RSI": float(
+                row["RSI"]
+            ),
+
+            "MACD": float(
+                row["MACD"]
+            ),
+
+            "MACD_SIGNAL": float(
+                row["MACD_SIGNAL"]
+            ),
+
+            "ATR": float(
+                row["ATR"]
+            ),
+
+            "ATR_PCT": float(
+                row["ATR_PCT"]
+            ),
+
+            "VOLATILITY": float(
+                row["VOLATILITY"]
+            )
+            if not pd.isna(
+                row["VOLATILITY"]
+            )
+            else None,
+
+            "regime": determine_market_regime(
+                df
+            ),
+        }
+
+    except Exception as e:
+        logger.exception(
+            "Technical summary error."
+        )
+        return {
+            "error": str(e)
+        }
+
+
+# ============================================================
+# 17. MULTI-TIMEFRAME ANALYSIS
 # ============================================================
 
 def analyze_timeframe(
-    yahoo_symbol,
-    timeframe,
+    symbol,
+    period,
+    interval
 ):
 
-    config = TIMEFRAMES.get(
-        timeframe
+    df, message = get_market_data(
+        symbol,
+        period,
+        interval
     )
 
-    if not config:
-
+    if df is None:
         return {
+            "status": "DATA_UNAVAILABLE",
+            "message": message,
+        }
 
-            "status":
-                "INVALID_TIMEFRAME",
+    df = calculate_indicators(df)
 
-            "timeframe":
-                timeframe,
+    df = detect_swing_points(df)
+
+    tech = technical_summary(df)
+
+    structure = determine_structure(df)
+
+    liquidity = detect_liquidity_event(
+        df
+    )
+
+    pd_zone = premium_discount_analysis(
+        df
+    )
+
+    fvg = detect_fvg(df)
+
+    ob = detect_order_blocks(df)
+
+    return {
+        "status": "OK",
+        "data_points": len(df),
+        "technical": tech,
+        "structure": structure,
+        "liquidity": liquidity,
+        "premium_discount": pd_zone,
+        "fvg": fvg,
+        "order_blocks": ob,
+        "last_timestamp": str(
+            df.index[-1]
+        ),
+    }
+
+
+def analyze_multi_timeframe(symbol):
+
+    results = {}
+
+    for tf, config in TIMEFRAMES.items():
+
+        period, interval = config
+
+        # 2h is built by resampling 1h data
+        if tf == "2h":
+
+            df, message = get_market_data(
+                symbol,
+                period="3mo",
+                interval="1h"
+            )
+
+            if df is None:
+                results[tf] = {
+                    "status": "DATA_UNAVAILABLE",
+                    "message": message,
+                }
+                continue
+
+            try:
+                df = df.resample(
+                    "2h"
+                ).agg({
+                    "Open": "first",
+                    "High": "max",
+                    "Low": "min",
+                    "Close": "last",
+                    "Volume": "sum",
+                }).dropna()
+
+                valid, msg = validate_dataframe(
+                    df
+                )
+
+                if not valid:
+                    results[tf] = {
+                        "status": "DATA_UNAVAILABLE",
+                        "message": msg,
+                    }
+                    continue
+
+                df = calculate_indicators(
+                    df
+                )
+
+                df = detect_swing_points(
+                    df
+                )
+
+                results[tf] = {
+                    "status": "OK",
+                    "data_points": len(df),
+                    "technical": technical_summary(
+                        df
+                    ),
+                    "structure": determine_structure(
+                        df
+                    ),
+                    "liquidity": detect_liquidity_event(
+                        df
+                    ),
+                    "premium_discount": premium_discount_analysis(
+                        df
+                    ),
+                }
+
+            except Exception as e:
+                results[tf] = {
+                    "status": "ERROR",
+                    "message": str(e),
+                }
+
+        else:
+
+            results[tf] = analyze_timeframe(
+                symbol,
+                period,
+                interval
+            )
+
+    return results
+
+
+# ============================================================
+# 18. NEWS ENGINE
+# ============================================================
+
+def get_news(
+    query="forex"
+):
+
+    if not ALPHA_VANTAGE_API_KEY:
+        return {
+            "status": "UNAVAILABLE",
+            "message": (
+                "ALPHA_VANTAGE_API_KEY "
+                "is not configured."
+            ),
+            "items": [],
         }
 
     try:
 
-        df = yf.download(
-
-            yahoo_symbol,
-
-            period=config["period"],
-
-            interval=config["interval"],
-
-            progress=False,
-
-            auto_adjust=False,
-
-            threads=False,
+        url = (
+            "https://www.alphavantage.co/"
+            "query"
         )
 
-        if isinstance(
-            df.columns,
-            pd.MultiIndex
-        ):
-
-            df.columns = [
-                column[0]
-                for column in df.columns
-            ]
-
-        valid, reason = (
-            validate_dataframe(df)
-        )
-
-        if not valid:
-
-            return {
-
-                "status":
-                    "DATA_UNAVAILABLE",
-
-                "timeframe":
-                    timeframe,
-
-                "reason":
-                    reason,
-            }
-
-        df = calculate_indicators(
-            df
-        )
-
-        regime = (
-            determine_market_regime(
-                df
-            )
-        )
-
-        trend = (
-            calculate_trend_strength(
-                df
-            )
-        )
-
-        latest = df.iloc[-1]
-
-        def safe_float(
-            value
-        ):
-
-            if pd.isna(value):
-                return None
-
-            return float(value)
-
-        return {
-
-            "status":
-                "OK",
-
-            "timeframe":
-                timeframe,
-
-            "timestamp":
-                str(df.index[-1]),
-
-            "close":
-                safe_float(
-                    latest["Close"]
-                ),
-
-            "ema20":
-                safe_float(
-                    latest["EMA_20"]
-                ),
-
-            "ema50":
-                safe_float(
-                    latest["EMA_50"]
-                ),
-
-            "ema200":
-                safe_float(
-                    latest["EMA_200"]
-                ),
-
-            "sma20":
-                safe_float(
-                    latest["SMA_20"]
-                ),
-
-            "sma50":
-                safe_float(
-                    latest["SMA_50"]
-                ),
-
-            "sma200":
-                safe_float(
-                    latest["SMA_200"]
-                ),
-
-            "rsi":
-                safe_float(
-                    latest["RSI_14"]
-                ),
-
-            "macd":
-                safe_float(
-                    latest["MACD"]
-                ),
-
-            "macd_signal":
-                safe_float(
-                    latest[
-                        "MACD_SIGNAL"
-                    ]
-                ),
-
-            "atr":
-                safe_float(
-                    latest["ATR_14"]
-                ),
-
-            "atr_percent":
-                safe_float(
-                    latest[
-                        "ATR_PERCENT"
-                    ]
-                ),
-
-            "regime":
-                regime,
-
-            "trend":
-                trend,
-
-            "rows":
-                len(df),
+        params = {
+            "function": "NEWS_SENTIMENT",
+            "apikey": ALPHA_VANTAGE_API_KEY,
+            "limit": 10,
         }
 
-    except Exception as error:
+        if query:
+            params["tickers"] = query
+
+        response = requests.get(
+            url,
+            params=params,
+            timeout=20,
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        feed = data.get(
+            "feed",
+            []
+        )
+
+        items = []
+
+        for item in feed[:10]:
+
+            items.append({
+                "title": item.get(
+                    "title",
+                    "Untitled"
+                ),
+                "source": item.get(
+                    "source",
+                    "Unknown"
+                ),
+                "published": item.get(
+                    "time_published",
+                    "Unknown"
+                ),
+                "url": item.get(
+                    "url",
+                    ""
+                ),
+            })
+
+        return {
+            "status": "OK",
+            "items": items,
+        }
+
+    except Exception as e:
 
         logger.exception(
-            "MTF error: %s",
-            error
+            "News API error."
         )
 
         return {
-
-            "status":
-                "ERROR",
-
-            "timeframe":
-                timeframe,
-
-            "reason":
-                str(error),
+            "status": "ERROR",
+            "message": str(e),
+            "items": [],
         }
 
 
 # ============================================================
-# MULTI-TIMEFRAME ANALYSIS
+# 19. SESSION FILTER
 # ============================================================
 
-def analyze_multi_timeframe(
-    symbol
-):
+def session_filter():
 
-    symbol = symbol.upper().strip()
+    hour = datetime.now(
+        timezone.utc
+    ).hour
 
-    yahoo_symbol = SYMBOL_MAP.get(
-        symbol
-    )
-
-    if not yahoo_symbol:
-
+    if 7 <= hour < 11:
         return {
-
-            "status":
-                "UNKNOWN_SYMBOL",
-
-            "symbol":
-                symbol,
+            "session": "LONDON",
+            "state": "ACTIVE",
         }
 
-    results = {}
+    if 12 <= hour < 16:
+        return {
+            "session": "NEW_YORK",
+            "state": "ACTIVE",
+        }
 
-    for timeframe in TIMEFRAMES:
+    if 0 <= hour < 7:
+        return {
+            "session": "ASIA",
+            "state": "ACTIVE",
+        }
 
-        results[timeframe] = (
-            analyze_timeframe(
-                yahoo_symbol,
-                timeframe,
-            )
-        )
+    if 11 <= hour < 12:
+        return {
+            "session": "LONDON/NY_TRANSITION",
+            "state": "WATCH",
+        }
+
+    if 16 <= hour < 17:
+        return {
+            "session": "NY_LATE",
+            "state": "WATCH",
+        }
 
     return {
-
-        "status":
-            "COMPLETED",
-
-        "symbol":
-            symbol,
-
-        "timeframes":
-            results,
+        "session": "LOW_ACTIVITY_WINDOW",
+        "state": "WAIT",
     }
 
 
 # ============================================================
-# TECHNICAL SUMMARY
+# 20. CONFLUENCE
 # ============================================================
 
-def create_technical_summary(
-    analysis
+def build_confluence(
+    technical,
+    structure,
+    liquidity,
+    pd_zone,
+    fvg,
+    order_blocks
 ):
 
-    if (
-        analysis.get("status")
-        != "COMPLETED"
-    ):
+    score = 0
+    evidence = []
+    conflicts = []
 
-        return (
-            "❌ Technical analysis "
-            "unavailable."
-        )
-
-    text = (
-
-        f"📊 *TECHNICAL ANALYSIS — "
-        f"{analysis['symbol']}*\n\n"
+    regime = technical.get(
+        "regime",
+        ""
     )
 
-    for timeframe, result in (
-        analysis["timeframes"].items()
+    rsi = technical.get(
+        "RSI",
+        50
+    )
+
+    ema20 = technical.get(
+        "EMA20"
+    )
+
+    ema50 = technical.get(
+        "EMA50"
+    )
+
+    # Trend
+    if (
+        ema20 is not None
+        and ema50 is not None
     ):
 
-        if result.get(
-            "status"
-        ) != "OK":
-
-            text += (
-
-                f"⏱ *{timeframe}*\n"
-                f"❌ DATA UNAVAILABLE\n"
-                f"Reason: "
-                f"{result.get('reason')}\n\n"
+        if ema20 > ema50:
+            score += 15
+            evidence.append(
+                "EMA20 above EMA50"
             )
 
-            continue
+        elif ema20 < ema50:
+            score += 15
+            evidence.append(
+                "EMA20 below EMA50"
+            )
 
-        regime = result[
-            "regime"
-        ]
-
-        trend = result[
-            "trend"
-        ]
-
-        text += (
-
-            f"⏱ *{timeframe}*\n"
-
-            f"Price: "
-            f"`{result['close']}`\n"
-
-            f"EMA20: "
-            f"`{result['ema20']}`\n"
-
-            f"EMA50: "
-            f"`{result['ema50']}`\n"
-
-            f"EMA200: "
-            f"`{result['ema200']}`\n"
-
-            f"RSI: "
-            f"`{result['rsi']}`\n"
-
-            f"MACD: "
-            f"`{result['macd']}`\n"
-
-            f"ATR: "
-            f"`{result['atr']}`\n"
-
-            f"Regime: "
-            f"`{regime.get('regime')}`\n"
-
-            f"Volatility: "
-            f"`{regime.get('volatility', 'N/A')}`\n"
-
-            f"Trend: "
-            f"`{trend.get('direction', 'N/A')}`\n"
-
-            f"Trend Score: "
-            f"`{trend.get('score', 0)}`\n\n"
+    # RSI
+    if rsi >= 55:
+        score += 10
+        evidence.append(
+            "RSI bullish zone"
         )
 
-    return text
+    elif rsi <= 45:
+        score += 10
+        evidence.append(
+            "RSI bearish zone"
+        )
+
+    else:
+        evidence.append(
+            "RSI neutral"
+        )
+
+    # Structure
+    structure_name = structure.get(
+        "structure",
+        "UNKNOWN"
+    )
+
+    if "HH" in structure_name:
+        score += 15
+        evidence.append(
+            "Higher-high structure evidence"
+        )
+
+    if "HL" in structure_name:
+        score += 10
+        evidence.append(
+            "Higher-low structure evidence"
+        )
+
+    if "LH" in structure_name:
+        score += 15
+        evidence.append(
+            "Lower-high structure evidence"
+        )
+
+    if "LL" in structure_name:
+        score += 10
+        evidence.append(
+            "Lower-low structure evidence"
+        )
+
+    # Liquidity
+    liquidity_event = liquidity.get(
+        "event",
+        ""
+    )
+
+    if "BOS" in liquidity_event:
+        score += 15
+        evidence.append(
+            liquidity_event
+        )
+
+    elif "SWEEP" in liquidity_event:
+        score += 10
+        evidence.append(
+            liquidity_event
+        )
+
+    # Premium / Discount
+    zone = pd_zone.get(
+        "zone",
+        "UNKNOWN"
+    )
+
+    if zone == "DISCOUNT":
+        evidence.append(
+            "Price in discount"
+        )
+
+    elif zone == "PREMIUM":
+        evidence.append(
+            "Price in premium"
+        )
+
+    elif zone == "EQUILIBRIUM":
+        evidence.append(
+            "Price near equilibrium"
+        )
+
+    # FVG / OB
+    if fvg:
+        score += 5
+        evidence.append(
+            f"{len(fvg)} recent FVG zone(s)"
+        )
+
+    if order_blocks:
+        score += 5
+        evidence.append(
+            f"{len(order_blocks)} recent OB zone(s)"
+        )
+
+    # Regime
+    if (
+        "TRENDING"
+        in regime
+    ):
+        score += 10
+        evidence.append(
+            "Trending regime"
+        )
+
+    elif (
+        "SIDEWAYS"
+        in regime
+    ):
+        conflicts.append(
+            "Sideways regime"
+        )
+
+    score = min(
+        100,
+        max(0, score)
+    )
+
+    if score >= 70:
+        status = "STRONG_RESEARCH_ALIGNMENT"
+
+    elif score >= 50:
+        status = "MODERATE_RESEARCH_ALIGNMENT"
+
+    elif score >= 30:
+        status = "WEAK_RESEARCH_ALIGNMENT"
+
+    else:
+        status = "INSUFFICIENT_EVIDENCE"
+
+    return {
+        "score": score,
+        "status": status,
+        "evidence": evidence,
+        "conflicts": conflicts,
+    }
 
 
 # ============================================================
-# TELEGRAM /START
+# 21. RESEARCH TP / SL
 # ============================================================
 
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+def calculate_research_tp_sl(
+    df,
+    bias
 ):
 
-    keyboard = [
+    try:
+
+        row = df.iloc[-1]
+
+        entry = float(
+            row["Close"]
+        )
+
+        atr = float(
+            row["ATR"]
+        )
+
+        if not math.isfinite(
+            atr
+        ) or atr <= 0:
+
+            return {
+                "status": "UNAVAILABLE"
+            }
+
+        recent_high = float(
+            df["High"]
+            .iloc[-10:-1]
+            .max()
+        )
+
+        recent_low = float(
+            df["Low"]
+            .iloc[-10:-1]
+            .min()
+        )
+
+        if bias == "BULLISH":
+
+            structure_sl = (
+                recent_low - 0.25 * atr
+            )
+
+            sl = structure_sl
+
+            risk = entry - sl
+
+            if risk <= 0:
+                return {
+                    "status": "UNAVAILABLE"
+                }
+
+            tp15 = (
+                entry + risk * 1.5
+            )
+
+            tp20 = (
+                entry + risk * 2
+            )
+
+            tp30 = (
+                entry + risk * 3
+            )
+
+        elif bias == "BEARISH":
+
+            structure_sl = (
+                recent_high + 0.25 * atr
+            )
+
+            sl = structure_sl
+
+            risk = sl - entry
+
+            if risk <= 0:
+                return {
+                    "status": "UNAVAILABLE"
+                }
+
+            tp15 = (
+                entry - risk * 1.5
+            )
+
+            tp20 = (
+                entry - risk * 2
+            )
+
+            tp30 = (
+                entry - risk * 3
+            )
+
+        else:
+
+            return {
+                "status": "NO_BIAS"
+            }
+
+        return {
+            "status": "RESEARCH_ONLY",
+            "entry_reference": entry,
+            "sl_reference": sl,
+            "risk_distance": risk,
+            "tp_1_5R": tp15,
+            "tp_2R": tp20,
+            "tp_3R": tp30,
+        }
+
+    except Exception as e:
+
+        logger.exception(
+            "TP/SL research error."
+        )
+
+        return {
+            "status": "ERROR",
+            "message": str(e),
+        }
+
+
+# ============================================================
+# 22. FULL RESEARCH PIPELINE
+# ============================================================
+
+def run_market_research(
+    symbol
+):
+
+    normalized, yf_symbol = resolve_symbol(
+        symbol
+    )
+
+    if not normalized:
+
+        return {
+            "status": "INVALID_SYMBOL",
+            "message": (
+                f"'{symbol}' is not "
+                "supported."
+            ),
+        }
+
+    # Main timeframe
+    df, message = get_market_data(
+        normalized,
+        period="1mo",
+        interval="1h"
+    )
+
+    if df is None:
+
+        return {
+            "status": "DATA_UNAVAILABLE",
+            "symbol": normalized,
+            "message": message,
+        }
+
+    df = calculate_indicators(
+        df
+    )
+
+    df = detect_swing_points(
+        df
+    )
+
+    technical = technical_summary(
+        df
+    )
+
+    structure = determine_structure(
+        df
+    )
+
+    liquidity = detect_liquidity_event(
+        df
+    )
+
+    pd_zone = premium_discount_analysis(
+        df
+    )
+
+    fvg = detect_fvg(
+        df
+    )
+
+    order_blocks = detect_order_blocks(
+        df
+    )
+
+    # Determine research bias
+    bias = "NEUTRAL"
+
+    regime = technical.get(
+        "regime",
+        ""
+    )
+
+    if "BULLISH" in regime:
+        bias = "BULLISH"
+
+    elif "BEARISH" in regime:
+        bias = "BEARISH"
+
+    # Session
+    session = session_filter()
+
+    # News
+    news = get_news(
+        "FOREX"
+    )
+
+    # Confluence
+    confluence = build_confluence(
+        technical,
+        structure,
+        liquidity,
+        pd_zone,
+        fvg,
+        order_blocks,
+    )
+
+    # Research TP/SL
+    research_levels = (
+        calculate_research_tp_sl(
+            df,
+            bias
+        )
+    )
+
+    # Protection / WAIT logic
+    wait_reasons = []
+
+    if session["state"] == "WAIT":
+        wait_reasons.append(
+            "Low-activity session window"
+        )
+
+    if (
+        confluence["score"] < 50
+    ):
+        wait_reasons.append(
+            "Insufficient confluence evidence"
+        )
+
+    if (
+        technical.get("regime")
+        == "UNKNOWN_REGIME"
+    ):
+        wait_reasons.append(
+            "Unknown market regime"
+        )
+
+    if (
+        news["status"] != "OK"
+    ):
+        wait_reasons.append(
+            "News data unavailable"
+        )
+
+    if wait_reasons:
+        final_state = "WAIT"
+    else:
+        final_state = (
+            "RESEARCH_SETUP_DETECTED"
+        )
+
+    # Multi-timeframe
+    mtf = analyze_multi_timeframe(
+        normalized
+    )
+
+    return {
+        "status": "OK",
+        "symbol": normalized,
+        "display_name": DISPLAY_NAMES.get(
+            normalized,
+            normalized
+        ),
+        "source": yf_symbol,
+        "main_data_points": len(df),
+        "last_timestamp": str(
+            df.index[-1]
+        ),
+        "technical": technical,
+        "structure": structure,
+        "liquidity": liquidity,
+        "premium_discount": pd_zone,
+        "fvg": fvg,
+        "order_blocks": order_blocks,
+        "bias": bias,
+        "session": session,
+        "news": news,
+        "confluence": confluence,
+        "research_levels": research_levels,
+        "multi_timeframe": mtf,
+        "final_state": final_state,
+        "wait_reasons": wait_reasons,
+        "mode": "RESEARCH/PAPER",
+    }
+
+
+# ============================================================
+# 23. FORMAT REPORT
+# ============================================================
+
+def format_research_report(
+    result
+):
+
+    if result["status"] != "OK":
+
+        return (
+            "⚠️ MARKET RESEARCH\n\n"
+            f"Status: {result['status']}\n"
+            f"Reason: {result.get('message', 'Unknown')}\n\n"
+            "আমি কোনো data তৈরি করে "
+            "দিচ্ছি না।"
+        )
+
+    tech = result["technical"]
+    structure = result["structure"]
+    liquidity = result["liquidity"]
+    pd_zone = result[
+        "premium_discount"
+    ]
+    confluence = result[
+        "confluence"
+    ]
+    session = result["session"]
+    levels = result[
+        "research_levels"
+    ]
+
+    lines = []
+
+    lines.append(
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    lines.append(
+        f"📊 {result['display_name']}"
+    )
+
+    lines.append(
+        "🔬 MARKET RESEARCH REPORT"
+    )
+
+    lines.append(
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    lines.append(
+        f"Mode: {result['mode']}"
+    )
+
+    lines.append(
+        f"Data Source: {result['source']}"
+    )
+
+    lines.append(
+        f"Data Points: {result['main_data_points']}"
+    )
+
+    lines.append(
+        f"Last Candle: {result['last_timestamp']}"
+    )
+
+    lines.append("")
+
+    # Price
+    lines.append(
+        f"💰 Price: {tech.get('price', 'N/A')}"
+    )
+
+    # Technical
+    lines.append("")
+    lines.append("📈 TECHNICAL")
+
+    lines.append(
+        f"EMA20: {tech.get('EMA20', 'N/A')}"
+    )
+
+    lines.append(
+        f"EMA50: {tech.get('EMA50', 'N/A')}"
+    )
+
+    lines.append(
+        f"RSI: {tech.get('RSI', 'N/A'):.2f}"
+    )
+
+    lines.append(
+        f"MACD: {tech.get('MACD', 'N/A'):.6f}"
+    )
+
+    lines.append(
+        f"ATR: {tech.get('ATR', 'N/A'):.6f}"
+    )
+
+    lines.append(
+        f"Regime: {tech.get('regime', 'N/A')}"
+    )
+
+    # Structure
+    lines.append("")
+    lines.append("🏗 STRUCTURE")
+
+    lines.append(
+        f"Structure: {structure.get('structure', 'N/A')}"
+    )
+
+    # Liquidity
+    lines.append("")
+    lines.append("💧 LIQUIDITY")
+
+    lines.append(
+        f"Event: {liquidity.get('event', 'N/A')}"
+    )
+
+    # Premium discount
+    lines.append("")
+    lines.append("⚖️ PREMIUM / DISCOUNT")
+
+    lines.append(
+        f"Zone: {pd_zone.get('zone', 'N/A')}"
+    )
+
+    # Session
+    lines.append("")
+    lines.append("🕒 SESSION")
+
+    lines.append(
+        f"{session['session']} | {session['state']}"
+    )
+
+    # Confluence
+    lines.append("")
+    lines.append("🧠 CONFLUENCE")
+
+    lines.append(
+        f"Score: {confluence['score']}/100"
+    )
+
+    lines.append(
+        f"Status: {confluence['status']}"
+    )
+
+    # Bias
+    lines.append("")
+    lines.append(
+        f"🔎 Research Bias: {result['bias']}"
+    )
+
+    # Research levels
+    lines.append("")
+    lines.append(
+        "📐 RESEARCH LEVELS"
+    )
+
+    if levels.get("status") == "RESEARCH_ONLY":
+
+        lines.append(
+            f"Reference Entry: "
+            f"{levels['entry_reference']}"
+        )
+
+        lines.append(
+            f"Research SL: "
+            f"{levels['sl_reference']}"
+        )
+
+        lines.append(
+            f"Research TP 1.5R: "
+            f"{levels['tp_1_5R']}"
+        )
+
+        lines.append(
+            f"Research TP 2R: "
+            f"{levels['tp_2R']}"
+        )
+
+        lines.append(
+            f"Research TP 3R: "
+            f"{levels['tp_3R']}"
+        )
+
+    else:
+
+        lines.append(
+            "Research levels unavailable."
+        )
+
+    # Final
+    lines.append("")
+    lines.append("🚦 FINAL STATE")
+
+    if result["final_state"] == "WAIT":
+
+        lines.append(
+            "🟡 WAIT / INSUFFICIENT CONFIRMATION"
+        )
+
+        for reason in result[
+            "wait_reasons"
+        ]:
+
+            lines.append(
+                f"• {reason}"
+            )
+
+    else:
+
+        lines.append(
+            "🟢 RESEARCH SETUP DETECTED"
+        )
+
+    lines.append("")
+
+    lines.append(
+        "⚠️ এটি research/paper analysis। "
+        "এটি guaranteed prediction বা "
+        "real-money trade instruction নয়।"
+    )
+
+    lines.append(
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    return "\n".join(lines)
+
+
+# ============================================================
+# 24. START MENU
+# ============================================================
+
+def main_keyboard():
+
+    return InlineKeyboardMarkup([
 
         [
             InlineKeyboardButton(
@@ -1519,495 +2123,793 @@ async def start_command(
 
         [
             InlineKeyboardButton(
-                "📰 News",
-                callback_data="news"
+                "🔬 Analyze Guide",
+                callback_data="analyze_guide"
             ),
 
             InlineKeyboardButton(
-                "📈 Analysis",
-                callback_data="analysis"
+                "📰 News",
+                callback_data="news"
             ),
         ],
 
         [
             InlineKeyboardButton(
                 "🤖 AI Chat",
-                callback_data="chat"
-            ),
-
-            InlineKeyboardButton(
-                "📖 Guide",
-                callback_data="guide"
+                callback_data="ai"
             ),
         ],
-    ]
+    ])
 
-    reply_markup = (
-        InlineKeyboardMarkup(
-            keyboard
-        )
+
+# ============================================================
+# 25. /START
+# ============================================================
+
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    text = (
+        "👋 আসসালামু আলাইকুম!\n\n"
+        "🤖 Market Research Bot অনলাইনে আছে।\n\n"
+
+        "📌 Supported assets:\n"
+        "EURUSD\n"
+        "GBPUSD\n"
+        "AUDUSD\n"
+        "NZDUSD\n"
+        "USDJPY\n"
+        "USDCHF\n"
+        "USDCAD\n"
+        "GOLD / XAUUSD\n"
+        "BTCUSD\n"
+        "ETHUSD\n\n"
+
+        "🔬 সরাসরি asset name লিখতে পারো:\n"
+        "EURUSD\n"
+        "AUDUSD\n"
+        "GOLD\n\n"
+
+        "অথবা:\n"
+        "/analyze EURUSD\n\n"
+
+        "⚠️ Mode: Research / Paper Trading"
     )
 
     await update.message.reply_text(
-
-        "🧠 *MASTER MARKET RESEARCH BOT*\n\n"
-
-        "Step 2A + Step 2B Online.\n\n"
-
-        "Available:\n"
-        "• Market Data\n"
-        "• News Engine\n"
-        "• Technical Indicators\n"
-        "• Multi-Timeframe Analysis\n"
-        "• Market Regime\n"
-        "• Gemini AI\n\n"
-
-        "⚠️ Research / educational mode.\n"
-        "No real-money trade execution.",
-
-        parse_mode="Markdown",
-
-        reply_markup=reply_markup,
+        text,
+        reply_markup=main_keyboard()
     )
 
 
 # ============================================================
-# /PRICE
+# 26. /HELP
+# ============================================================
+
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    text = (
+        "📚 COMMAND GUIDE\n\n"
+
+        "/start — Main menu\n"
+        "/help — Commands\n"
+        "/price EURUSD — Price/data check\n"
+        "/analyze EURUSD — Full research\n"
+        "/news — News check\n"
+        "/health — System health\n\n"
+
+        "Direct asset:\n"
+        "EURUSD\n"
+        "AUDUSD\n"
+        "GOLD\n"
+        "BTCUSD\n\n"
+
+        "সাধারণ কথাও লিখতে পারো। "
+        "Bot চুপ থাকবে না।"
+    )
+
+    await update.message.reply_text(
+        text
+    )
+
+
+# ============================================================
+# 27. /HEALTH
+# ============================================================
+
+async def health_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    text = (
+        "❤️ SYSTEM HEALTH\n\n"
+
+        f"Telegram: "
+        f"{'READY' if TELEGRAM_BOT_TOKEN else 'MISSING'}\n"
+
+        f"Gemini: "
+        f"{'READY' if gemini_client else 'NOT CONFIGURED'}\n"
+
+        f"News API: "
+        f"{'READY' if ALPHA_VANTAGE_API_KEY else 'NOT CONFIGURED'}\n"
+
+        f"Market Data: Yahoo Finance adapter\n"
+
+        f"Mode: Research / Paper\n\n"
+
+        "No fake market data is generated."
+    )
+
+    await update.message.reply_text(
+        text
+    )
+
+
+# ============================================================
+# 28. /PRICE
 # ============================================================
 
 async def price_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     if not context.args:
 
         await update.message.reply_text(
-
-            "Example:\n\n"
-
+            "ব্যবহার:\n"
             "/price EURUSD\n"
-            "/price XAUUSD\n"
+            "/price GOLD\n"
             "/price BTCUSD"
         )
 
         return
 
-    symbol = (
-        context.args[0]
-        .upper()
-    )
+    symbol = context.args[0]
 
-    await update.message.reply_text(
-
-        "🔎 Fetching market data..."
-    )
-
-    data = get_market_data(
-
-        symbol=symbol,
-
+    df, message = get_market_data(
+        symbol,
         period="5d",
+        interval="1h"
+    )
 
-        interval="1h",
+    if df is None:
+
+        await update.message.reply_text(
+            "⚠️ PRICE DATA UNAVAILABLE\n\n"
+            f"Symbol: {symbol}\n"
+            f"Reason: {message}\n\n"
+            "আমি কোনো fake price দেখাচ্ছি না।"
+        )
+
+        return
+
+    last = df.iloc[-1]
+
+    text = (
+        "💰 PRICE / DATA CHECK\n\n"
+        f"Symbol: {symbol.upper()}\n"
+        f"Price: {float(last['Close'])}\n"
+        f"Last candle: {df.index[-1]}\n"
+        f"Candles: {len(df)}\n\n"
+        "⚠️ এই data exact broker OTC feed "
+        "নাও হতে পারে।"
     )
 
     await update.message.reply_text(
-
-        format_price(data),
-
-        parse_mode="Markdown",
+        text
     )
 
 
 # ============================================================
-# /ANALYZE
+# 29. /ANALYZE
 # ============================================================
 
 async def analyze_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     if not context.args:
 
         await update.message.reply_text(
-
-            "Example:\n\n"
+            "ব্যবহার:\n\n"
             "/analyze EURUSD\n"
-            "/analyze XAUUSD\n"
-            "/analyze BTCUSD"
+            "/analyze AUDUSD\n"
+            "/analyze GOLD"
         )
 
         return
 
-    symbol = (
-        context.args[0]
-        .upper()
-    )
+    symbol = context.args[0]
 
     await update.message.reply_text(
-
-        f"🔬 Analyzing `{symbol}` "
-        f"across multiple timeframes...",
-        parse_mode="Markdown",
+        f"🔄 {symbol.upper()} research শুরু হয়েছে...\n"
+        "Data → Technical → MTF → Structure → "
+        "Liquidity → P/D → Confluence..."
     )
 
-    analysis = (
-        analyze_multi_timeframe(
+    try:
+
+        result = run_market_research(
             symbol
         )
-    )
 
-    text = (
-        create_technical_summary(
-            analysis
+        report = format_research_report(
+            result
         )
-    )
 
-    await update.message.reply_text(
+        await update.message.reply_text(
+            report
+        )
 
-        text,
+    except Exception as e:
 
-        parse_mode="Markdown",
-    )
+        logger.exception(
+            "Analyze command failed."
+        )
+
+        await update.message.reply_text(
+            "❌ ANALYSIS ERROR\n\n"
+            f"Reason: {str(e)}\n\n"
+            "Bot চুপ করবে না; error এখানে দেখানো হলো।"
+        )
 
 
 # ============================================================
-# /NEWS
+# 30. /NEWS
 # ============================================================
 
 async def news_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
-    query = "forex"
+    await update.message.reply_text(
+        "📰 News engine চালু করা হচ্ছে..."
+    )
 
-    if context.args:
+    result = get_news(
+        "FOREX"
+    )
 
-        query = " ".join(
-            context.args
+    if result["status"] != "OK":
+
+        await update.message.reply_text(
+            "📰 NEWS STATUS\n\n"
+            f"{result.get('message', 'Unavailable')}\n\n"
+            "API unavailable হলে bot "
+            "fake news তৈরি করবে না।"
+        )
+
+        return
+
+    items = result["items"]
+
+    if not items:
+
+        await update.message.reply_text(
+            "📰 কোনো news item পাওয়া যায়নি।"
+        )
+
+        return
+
+    lines = [
+        "📰 LATEST AVAILABLE NEWS\n"
+    ]
+
+    for i, item in enumerate(
+        items[:8],
+        start=1
+    ):
+
+        lines.append(
+            f"{i}. {item['title']}\n"
+            f"Source: {item['source']}\n"
+            f"Published: {item['published']}\n"
         )
 
     await update.message.reply_text(
-
-        "📰 Fetching latest news..."
-    )
-
-    data = get_news(
-        query=query,
-        limit=5,
-    )
-
-    await update.message.reply_text(
-
-        format_news(data),
-
-        parse_mode="Markdown",
+        "\n".join(lines)
     )
 
 
 # ============================================================
-# BUTTON HANDLER
+# 31. GEMINI CHAT
+# ============================================================
+
+async def gemini_chat(
+    user_text
+):
+
+    if gemini_client is None:
+
+        return (
+            "🤖 AI Chat এখন unavailable.\n\n"
+            "GEMINI_API_KEY configure করা হয়নি "
+            "অথবা Gemini client initialize হয়নি।"
+        )
+
+    prompt = f"""
+You are the educational AI assistant inside a
+market research and paper-trading application.
+
+User message:
+{user_text}
+
+Rules:
+- Explain clearly.
+- Do not claim guaranteed future price movement.
+- Do not fabricate live market data.
+- If live data is unavailable, say so.
+- Do not provide real-money execution instructions.
+- Keep the answer educational and research-focused.
+"""
+
+    try:
+
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+        )
+
+        text = getattr(
+            response,
+            "text",
+            None
+        )
+
+        if text:
+            return text
+
+        return (
+            "🤖 Gemini কোনো text response দেয়নি।"
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Gemini error."
+        )
+
+        return (
+            "🤖 AI ERROR\n\n"
+            f"{str(e)}"
+        )
+
+
+# ============================================================
+# 32. BUTTON HANDLER
 # ============================================================
 
 async def button_handler(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     query = update.callback_query
 
     await query.answer()
 
-    action = query.data
+    data = query.data
 
-    # --------------------------------------------------------
-    # WATCHLIST
-    # --------------------------------------------------------
-
-    if action == "watchlist":
+    if data == "watchlist":
 
         text = (
-            "📊 *WATCHLIST*\n\n"
+            "📊 WATCHLIST\n\n"
+            + "\n".join(
+                f"• {x}"
+                for x in WATCHLIST
+            )
+            + "\n\n"
+            "Example:\n"
+            "EURUSD"
         )
 
-        for symbol in WATCHLIST:
+        await query.edit_message_text(
+            text
+        )
 
-            text += (
-                f"• `{symbol}`\n"
+    elif data == "health":
+
+        text = (
+            "❤️ SYSTEM HEALTH\n\n"
+            f"Telegram: "
+            f"{'READY' if TELEGRAM_BOT_TOKEN else 'MISSING'}\n"
+            f"Gemini: "
+            f"{'READY' if gemini_client else 'NOT CONFIGURED'}\n"
+            f"News API: "
+            f"{'READY' if ALPHA_VANTAGE_API_KEY else 'NOT CONFIGURED'}\n"
+            "Market Data: Yahoo adapter\n"
+            "Mode: Research/Paper"
+        )
+
+        await query.edit_message_text(
+            text
+        )
+
+    elif data == "analyze_guide":
+
+        text = (
+            "🔬 ANALYZE\n\n"
+            "লিখো:\n\n"
+            "/analyze EURUSD\n"
+            "/analyze AUDUSD\n"
+            "/analyze GOLD\n\n"
+
+            "Pipeline:\n"
+            "Data validation\n"
+            "Technical indicators\n"
+            "Multi-timeframe\n"
+            "Market structure\n"
+            "Liquidity\n"
+            "FVG\n"
+            "Order Block research\n"
+            "Premium/Discount\n"
+            "Session\n"
+            "News availability\n"
+            "Confluence\n"
+            "Research TP/SL\n"
+            "Final WAIT/Research state"
+        )
+
+        await query.edit_message_text(
+            text
+        )
+
+    elif data == "news":
+
+        result = get_news(
+            "FOREX"
+        )
+
+        if result["status"] != "OK":
+
+            await query.edit_message_text(
+                "📰 NEWS UNAVAILABLE\n\n"
+                + result.get(
+                    "message",
+                    "Unknown error"
+                )
             )
 
-        text += (
-            "\nUse:\n"
-            "`/price EURUSD`\n"
-            "`/analyze EURUSD`"
-        )
+            return
+
+        items = result["items"]
+
+        if not items:
+
+            await query.edit_message_text(
+                "📰 No news data available."
+            )
+
+            return
+
+        text = "📰 NEWS\n\n"
+
+        for i, item in enumerate(
+            items[:5],
+            1
+        ):
+
+            text += (
+                f"{i}. {item['title']}\n"
+                f"{item['source']}\n\n"
+            )
 
         await query.edit_message_text(
-
-            text,
-
-            parse_mode="Markdown",
+            text
         )
 
-    # --------------------------------------------------------
-    # HEALTH
-    # --------------------------------------------------------
-
-    elif action == "health":
-
-        text = (
-
-            "❤️ *SYSTEM HEALTH*\n\n"
-
-            "Telegram: `ONLINE`\n"
-
-            f"Gemini: "
-            f"`{'ONLINE' if gemini_client else 'OFFLINE'}`\n"
-
-            f"News Engine: "
-            f"`{'ONLINE' if ALPHA_VANTAGE_API_KEY else 'OFFLINE'}`\n"
-
-            "Market Data: `CONNECTED`\n"
-
-            "Technical Engine: `ONLINE`\n"
-
-            "Trading Execution: `DISABLED`"
-        )
+    elif data == "ai":
 
         await query.edit_message_text(
-
-            text,
-
-            parse_mode="Markdown",
-        )
-
-    # --------------------------------------------------------
-    # NEWS
-    # --------------------------------------------------------
-
-    elif action == "news":
-
-        data = get_news(
-            query="forex",
-            limit=5,
-        )
-
-        await query.edit_message_text(
-
-            format_news(data),
-
-            parse_mode="Markdown",
-        )
-
-    # --------------------------------------------------------
-    # ANALYSIS
-    # --------------------------------------------------------
-
-    elif action == "analysis":
-
-        await query.edit_message_text(
-
-            "📈 *TECHNICAL ANALYSIS*\n\n"
-
-            "Use commands:\n\n"
-
-            "`/analyze EURUSD`\n"
-            "`/analyze XAUUSD`\n"
-            "`/analyze BTCUSD`\n\n"
-
-            "The engine checks multiple "
-            "timeframes and indicators.",
-
-            parse_mode="Markdown",
-        )
-
-    # --------------------------------------------------------
-    # CHAT
-    # --------------------------------------------------------
-
-    elif action == "chat":
-
-        await query.edit_message_text(
-
-            "🤖 *AI CHAT*\n\n"
-
-            "Send a message such as:\n\n"
-
-            "`Explain RSI`\n"
-            "`Explain MACD`\n"
-            "`What is market regime?`\n"
-            "`Explain liquidity`\n\n"
-
-            "AI answers are educational "
-            "and do not represent guaranteed "
-            "future market outcomes.",
-
-            parse_mode="Markdown",
-        )
-
-    # --------------------------------------------------------
-    # GUIDE
-    # --------------------------------------------------------
-
-    elif action == "guide":
-
-        await query.edit_message_text(
-
-            "📖 *BOT GUIDE*\n\n"
-
-            "/price SYMBOL\n"
-            "→ Market data\n\n"
-
-            "/analyze SYMBOL\n"
-            "→ Multi-timeframe technical "
-            "analysis\n\n"
-
-            "/news forex\n"
-            "→ Latest market news\n\n"
-
-            "Supported examples:\n"
-            "EURUSD\n"
-            "GBPUSD\n"
-            "USDJPY\n"
-            "XAUUSD\n"
-            "BTCUSD\n"
-            "ETHUSD",
-
-            parse_mode="Markdown",
+            "🤖 AI CHAT\n\n"
+            "AI-কে প্রশ্ন করতে নিচে "
+            "সাধারণ message পাঠাও।"
         )
 
 
 # ============================================================
-# GEMINI CHAT
+# 33. DIRECT ASSET DETECTOR
+# ============================================================
+
+def detect_asset_from_message(
+    text
+):
+
+    normalized = normalize_symbol(
+        text
+    )
+
+    if normalized in SYMBOL_MAP:
+        return normalized
+
+    return None
+
+
+# ============================================================
+# 34. GENERAL MESSAGE HANDLER
 # ============================================================
 
 async def handle_message(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
-    user_text = (
-        update.message.text
-    )
+    if not update.message:
+        return
 
-    if not gemini_client:
+    text = (
+        update.message.text
+        or ""
+    ).strip()
+
+    if not text:
 
         await update.message.reply_text(
-
-            "❌ Gemini AI is currently "
-            "unavailable."
+            "আমি empty message পেয়েছি। "
+            "EURUSD / GOLD / Hi লিখে চেষ্টা করো।"
         )
 
         return
 
-    system_prompt = (
+    # ----------------------------------------
+    # 1. DIRECT ASSET
+    # ----------------------------------------
 
-        "You are an educational "
-        "market research assistant. "
-
-        "Explain trading concepts, "
-        "technical analysis, market "
-        "structure, indicators, ICT/SMC "
-        "concepts and financial concepts "
-        "clearly. "
-
-        "Do not claim guaranteed accuracy. "
-
-        "Do not pretend to have live market "
-        "data unless it is actually provided "
-        "by the data engine. "
-
-        "Do not provide instructions for "
-        "real-money gambling or binary "
-        "options trading."
+    asset = detect_asset_from_message(
+        text
     )
 
-    prompt = (
-        system_prompt
-        + "\n\nUser question:\n"
-        + user_text
-    )
+    if asset:
 
-    try:
+        await update.message.reply_text(
+            f"🔎 {DISPLAY_NAMES.get(asset, asset)} "
+            "detected.\n\n"
+            "🔄 Research pipeline শুরু করছি..."
+        )
 
-        response = (
-            await gemini_client.aio.models
-            .generate_content(
+        try:
 
-                model=GEMINI_MODEL,
-
-                contents=prompt,
+            result = run_market_research(
+                asset
             )
-        )
 
-        answer = (
-            response.text
-            if response.text
-            else "No response."
-        )
+            report = format_research_report(
+                result
+            )
+
+            await update.message.reply_text(
+                report
+            )
+
+        except Exception as e:
+
+            logger.exception(
+                "Direct asset analysis failed."
+            )
+
+            await update.message.reply_text(
+                "❌ Analysis error\n\n"
+                f"{str(e)}"
+            )
+
+        return
+
+    # ----------------------------------------
+    # 2. NATURAL COMMAND-LIKE TEXT
+    # ----------------------------------------
+
+    lower = text.lower()
+
+    if (
+        "analyze" in lower
+        or "analysis" in lower
+        or "analyse" in lower
+    ):
+
+        found = None
+
+        for key in SYMBOL_MAP:
+
+            if key.lower() in lower:
+
+                found = key
+                break
+
+        if found:
+
+            await update.message.reply_text(
+                f"🔎 {found} detected.\n"
+                "Research শুরু করছি..."
+            )
+
+            try:
+
+                result = run_market_research(
+                    found
+                )
+
+                await update.message.reply_text(
+                    format_research_report(
+                        result
+                    )
+                )
+
+            except Exception as e:
+
+                logger.exception(
+                    "Natural analysis failed."
+                )
+
+                await update.message.reply_text(
+                    f"❌ Error: {str(e)}"
+                )
+
+            return
+
+    # ----------------------------------------
+    # 3. GREETING
+    # ----------------------------------------
+
+    greetings = {
+        "hi",
+        "hello",
+        "hey",
+        "হাই",
+        "হ্যালো",
+        "আসসালামু আলাইকুম",
+        "salam",
+    }
+
+    if lower in greetings:
 
         await update.message.reply_text(
-            answer
+            "👋 Wa Alaikum Assalam!\n\n"
+            "আমি অনলাইনে আছি। 😊\n\n"
+            "তুমি EURUSD, AUDUSD, GOLD "
+            "বা /analyze EURUSD লিখতে পারো।"
         )
 
-    except Exception as error:
+        return
 
-        logger.exception(
-            "Gemini error: %s",
-            error
-        )
+    # ----------------------------------------
+    # 4. HELP KEYWORDS
+    # ----------------------------------------
+
+    if lower in {
+        "help",
+        "menu",
+        "guide",
+        "কী করতে পারি",
+        "কি করতে পারি",
+    }:
 
         await update.message.reply_text(
-
-            "❌ AI request failed.\n"
-            "Please try again later."
+            "📚 তুমি করতে পারো:\n\n"
+            "• EURUSD\n"
+            "• AUDUSD\n"
+            "• GOLD\n"
+            "• /analyze EURUSD\n"
+            "• /price GOLD\n"
+            "• /news\n"
+            "• /health\n"
+            "• সাধারণ প্রশ্ন"
         )
+
+        return
+
+    # ----------------------------------------
+    # 5. GEMINI FALLBACK
+    # ----------------------------------------
+
+    reply = await gemini_chat(
+        text
+    )
+
+    await update.message.reply_text(
+        reply
+    )
 
 
 # ============================================================
-# GLOBAL ERROR HANDLER
+# 35. GLOBAL ERROR HANDLER
 # ============================================================
 
 async def error_handler(
     update: object,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     logger.exception(
-        "Telegram error:",
+        "Unhandled Telegram error:",
         exc_info=context.error
     )
 
+    try:
+
+        if isinstance(
+            update,
+            Update
+        ) and update.effective_message:
+
+            await update.effective_message.reply_text(
+                "⚠️ Bot-এর ভিতরে একটি error হয়েছে।\n\n"
+                f"{context.error}\n\n"
+                "Bot silent failure না করে error দেখিয়েছে।"
+            )
+
+    except Exception:
+        logger.exception(
+            "Could not send error message."
+        )
+
 
 # ============================================================
-# MAIN
+# 36. BOT COMMAND SETUP
+# ============================================================
+
+async def post_init(
+    application: Application
+):
+
+    try:
+
+        await application.bot.set_my_commands([
+            ("start", "Open main menu"),
+            ("help", "Show help"),
+            ("price", "Check market data"),
+            ("analyze", "Research an asset"),
+            ("news", "Check available news"),
+            ("health", "System health"),
+        ])
+
+        logger.info(
+            "Bot commands registered."
+        )
+
+    except Exception:
+        logger.exception(
+            "Could not register commands."
+        )
+
+
+# ============================================================
+# 37. MAIN
 # ============================================================
 
 def main():
 
-    # Start Flask in background
+    if not TELEGRAM_BOT_TOKEN:
+
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN is missing."
+        )
+
+    # Start Render health server
     flask_thread = threading.Thread(
-
         target=run_flask,
-
-        daemon=True,
+        daemon=True
     )
 
     flask_thread.start()
 
     logger.info(
-        "Health server started."
+        "Flask health server started."
     )
 
     # Telegram application
     application = (
-        Application.builder()
-        .token(
-            TELEGRAM_BOT_TOKEN
-        )
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
         .build()
     )
 
@@ -2016,6 +2918,20 @@ def main():
         CommandHandler(
             "start",
             start_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "help",
+            help_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "health",
+            health_command
         )
     )
 
@@ -2042,21 +2958,17 @@ def main():
 
     # Buttons
     application.add_handler(
-
         CallbackQueryHandler(
             button_handler
         )
     )
 
-    # AI Chat
+    # ALL TEXT
     application.add_handler(
-
         MessageHandler(
-
             filters.TEXT
             & ~filters.COMMAND,
-
-            handle_message,
+            handle_message
         )
     )
 
@@ -2066,7 +2978,15 @@ def main():
     )
 
     logger.info(
-        "Telegram bot starting..."
+        "================================"
+    )
+
+    logger.info(
+        "MARKET RESEARCH BOT STARTING"
+    )
+
+    logger.info(
+        "================================"
     )
 
     application.run_polling(
@@ -2075,1506 +2995,8 @@ def main():
 
 
 # ============================================================
-# ENTRY POINT
+# 38. ENTRY POINT
 # ============================================================
 
 if __name__ == "__main__":
-
     main()
-    # ============================================================
-# STEP 2C + 2D + 2E + 2F
-# PROFESSIONAL MARKET RESEARCH ENGINE
-# ============================================================
-
-import pandas as pd
-import numpy as np
-
-
-# ============================================================
-# 2C — ICT / SMC + MARKET STRUCTURE ENGINE
-# ============================================================
-
-def detect_swing_points(df, lookback=3):
-    """Confirmed historical swing high/low detection."""
-
-    try:
-        df = df.copy()
-
-        df["Swing_High"] = False
-        df["Swing_Low"] = False
-
-        if len(df) < (lookback * 2 + 1):
-            return df
-
-        for i in range(lookback, len(df) - lookback):
-
-            current_high = df["High"].iloc[i]
-            current_low = df["Low"].iloc[i]
-
-            left_highs = df["High"].iloc[i-lookback:i]
-            right_highs = df["High"].iloc[i+1:i+lookback+1]
-
-            left_lows = df["Low"].iloc[i-lookback:i]
-            right_lows = df["Low"].iloc[i+1:i+lookback+1]
-
-            if (
-                current_high > left_highs.max()
-                and current_high > right_highs.max()
-            ):
-                df.loc[df.index[i], "Swing_High"] = True
-
-            if (
-                current_low < left_lows.min()
-                and current_low < right_lows.min()
-            ):
-                df.loc[df.index[i], "Swing_Low"] = True
-
-        return df
-
-    except Exception as e:
-        logger.error(f"Swing detection error: {e}")
-        return df
-
-
-# ------------------------------------------------------------
-# MARKET STRUCTURE
-# ------------------------------------------------------------
-
-def determine_structure(df):
-
-    try:
-        if len(df) < 20:
-            return {
-                "structure": "UNKNOWN",
-                "reason": "Insufficient candles"
-            }
-
-        df = detect_swing_points(df)
-
-        highs = df[df["Swing_High"]]
-        lows = df[df["Swing_Low"]]
-
-        if len(highs) < 2 or len(lows) < 2:
-            return {
-                "structure": "UNKNOWN",
-                "reason": "Insufficient confirmed swing points"
-            }
-
-        previous_high = float(highs["High"].iloc[-2])
-        latest_high = float(highs["High"].iloc[-1])
-
-        previous_low = float(lows["Low"].iloc[-2])
-        latest_low = float(lows["Low"].iloc[-1])
-
-        if latest_high > previous_high and latest_low > previous_low:
-
-            structure = "BULLISH_STRUCTURE"
-
-        elif latest_high < previous_high and latest_low < previous_low:
-
-            structure = "BEARISH_STRUCTURE"
-
-        else:
-
-            structure = "MIXED_STRUCTURE"
-
-        return {
-            "structure": structure,
-            "last_swing_high": latest_high,
-            "last_swing_low": latest_low,
-            "previous_swing_high": previous_high,
-            "previous_swing_low": previous_low
-        }
-
-    except Exception as e:
-
-        logger.error(f"Structure error: {e}")
-
-        return {
-            "structure": "UNKNOWN",
-            "reason": str(e)
-        }
-
-
-# ------------------------------------------------------------
-# LIQUIDITY SWEEP vs BOS
-# ------------------------------------------------------------
-
-def detect_liquidity_event(df):
-
-    try:
-
-        if len(df) < 10:
-            return {
-                "event": "UNKNOWN",
-                "confirmation": False
-            }
-
-        df = detect_swing_points(df)
-
-        swing_highs = df[df["Swing_High"]]
-        swing_lows = df[df["Swing_Low"]]
-
-        last = df.iloc[-1]
-
-        result = {
-            "event": "NONE",
-            "level": None,
-            "confirmation": False
-        }
-
-        # -------------------------
-        # BUY-SIDE LIQUIDITY
-        # -------------------------
-
-        if len(swing_highs) > 0:
-
-            level = float(
-                swing_highs["High"].iloc[-1]
-            )
-
-            if last["High"] > level:
-
-                if last["Close"] <= level:
-
-                    return {
-                        "event": "BUY_SIDE_LIQUIDITY_SWEEP",
-                        "level": level,
-                        "confirmation": False
-                    }
-
-                elif last["Close"] > level:
-
-                    return {
-                        "event": "POTENTIAL_BULLISH_BOS",
-                        "level": level,
-                        "confirmation": True
-                    }
-
-        # -------------------------
-        # SELL-SIDE LIQUIDITY
-        # -------------------------
-
-        if len(swing_lows) > 0:
-
-            level = float(
-                swing_lows["Low"].iloc[-1]
-            )
-
-            if last["Low"] < level:
-
-                if last["Close"] >= level:
-
-                    return {
-                        "event": "SELL_SIDE_LIQUIDITY_SWEEP",
-                        "level": level,
-                        "confirmation": False
-                    }
-
-                elif last["Close"] < level:
-
-                    return {
-                        "event": "POTENTIAL_BEARISH_BOS",
-                        "level": level,
-                        "confirmation": True
-                    }
-
-        return result
-
-    except Exception as e:
-
-        logger.error(f"Liquidity error: {e}")
-
-        return {
-            "event": "UNKNOWN",
-            "confirmation": False
-        }
-
-
-# ------------------------------------------------------------
-# FAIR VALUE GAP
-# ------------------------------------------------------------
-
-def detect_fvg(df):
-
-    try:
-
-        if len(df) < 3:
-            return []
-
-        fvg_list = []
-
-        for i in range(2, len(df)):
-
-            candle_1_high = float(
-                df["High"].iloc[i - 2]
-            )
-
-            candle_1_low = float(
-                df["Low"].iloc[i - 2]
-            )
-
-            candle_3_high = float(
-                df["High"].iloc[i]
-            )
-
-            candle_3_low = float(
-                df["Low"].iloc[i]
-            )
-
-            # Bullish FVG
-            if candle_3_low > candle_1_high:
-
-                fvg_list.append({
-                    "type": "BULLISH_FVG",
-                    "low": candle_1_high,
-                    "high": candle_3_low,
-                    "index": i
-                })
-
-            # Bearish FVG
-            elif candle_3_high < candle_1_low:
-
-                fvg_list.append({
-                    "type": "BEARISH_FVG",
-                    "low": candle_3_high,
-                    "high": candle_1_low,
-                    "index": i
-                })
-
-        return fvg_list[-10:]
-
-    except Exception as e:
-
-        logger.error(f"FVG error: {e}")
-
-        return []
-
-
-# ------------------------------------------------------------
-# ORDER BLOCK
-# ------------------------------------------------------------
-
-def detect_order_blocks(df):
-
-    try:
-
-        if len(df) < 10:
-            return []
-
-        blocks = []
-
-        for i in range(1, len(df)):
-
-            previous = df.iloc[i - 1]
-            current = df.iloc[i]
-
-            # Bullish OB
-            if (
-                previous["Close"] < previous["Open"]
-                and current["Close"] > current["Open"]
-                and current["Close"] > previous["High"]
-            ):
-
-                blocks.append({
-                    "type": "BULLISH_OB",
-                    "low": float(previous["Low"]),
-                    "high": float(previous["High"]),
-                    "index": i - 1
-                })
-
-            # Bearish OB
-            elif (
-                previous["Close"] > previous["Open"]
-                and current["Close"] < current["Open"]
-                and current["Close"] < previous["Low"]
-            ):
-
-                blocks.append({
-                    "type": "BEARISH_OB",
-                    "low": float(previous["Low"]),
-                    "high": float(previous["High"]),
-                    "index": i - 1
-                })
-
-        return blocks[-10:]
-
-    except Exception as e:
-
-        logger.error(f"Order block error: {e}")
-
-        return []
-
-
-# ------------------------------------------------------------
-# PREMIUM / DISCOUNT
-# ------------------------------------------------------------
-
-def premium_discount_analysis(df):
-
-    try:
-
-        df = detect_swing_points(df)
-
-        highs = df[df["Swing_High"]]
-        lows = df[df["Swing_Low"]]
-
-        if highs.empty or lows.empty:
-
-            return {
-                "zone": "UNKNOWN"
-            }
-
-        swing_high = float(
-            highs["High"].iloc[-1]
-        )
-
-        swing_low = float(
-            lows["Low"].iloc[-1]
-        )
-
-        midpoint = (
-            swing_high + swing_low
-        ) / 2
-
-        price = float(
-            df["Close"].iloc[-1]
-        )
-
-        if price > midpoint:
-
-            zone = "PREMIUM"
-
-        elif price < midpoint:
-
-            zone = "DISCOUNT"
-
-        else:
-
-            zone = "EQUILIBRIUM"
-
-        return {
-            "zone": zone,
-            "swing_high": swing_high,
-            "swing_low": swing_low,
-            "midpoint": midpoint,
-            "price": price
-        }
-
-    except Exception as e:
-
-        logger.error(
-            f"Premium/Discount error: {e}"
-        )
-
-        return {
-            "zone": "UNKNOWN"
-        }
-
-
-# ============================================================
-# 2D — CONFLUENCE ENGINE
-# ============================================================
-
-def build_confluence(
-    technical,
-    structure,
-    liquidity,
-    pd_zone,
-    fvg_list,
-    order_blocks
-):
-
-    evidence = []
-    conflicts = []
-
-    score = 0
-
-    # -------------------------
-    # STRUCTURE
-    # -------------------------
-
-    struct = structure.get(
-        "structure",
-        "UNKNOWN"
-    )
-
-    if struct == "BULLISH_STRUCTURE":
-
-        evidence.append(
-            "Bullish market structure"
-        )
-
-        score += 20
-
-    elif struct == "BEARISH_STRUCTURE":
-
-        evidence.append(
-            "Bearish market structure"
-        )
-
-        score += 20
-
-    else:
-
-        conflicts.append(
-            "Structure mixed or uncertain"
-        )
-
-    # -------------------------
-    # REGIME
-    # -------------------------
-
-    regime = technical.get(
-        "regime",
-        "UNKNOWN"
-    )
-
-    if regime in [
-        "BULLISH_TRENDING",
-        "BEARISH_TRENDING"
-    ]:
-
-        evidence.append(
-            f"Market regime: {regime}"
-        )
-
-        score += 10
-
-    elif regime == "SIDEWAYS_RANGE":
-
-        conflicts.append(
-            "Market is ranging"
-        )
-
-    # -------------------------
-    # LIQUIDITY
-    # -------------------------
-
-    event = liquidity.get(
-        "event",
-        "NONE"
-    )
-
-    if "SWEEP" in event:
-
-        evidence.append(event)
-
-        score += 15
-
-    elif "BOS" in event:
-
-        evidence.append(
-            "Potential BOS with candle close"
-        )
-
-        score += 20
-
-    # -------------------------
-    # PREMIUM / DISCOUNT
-    # -------------------------
-
-    zone = pd_zone.get(
-        "zone",
-        "UNKNOWN"
-    )
-
-    if zone == "DISCOUNT":
-
-        evidence.append(
-            "Price in discount zone"
-        )
-
-        score += 10
-
-    elif zone == "PREMIUM":
-
-        evidence.append(
-            "Price in premium zone"
-        )
-
-        score += 10
-
-    else:
-
-        conflicts.append(
-            "Premium/Discount unavailable"
-        )
-
-    # -------------------------
-    # FVG
-    # -------------------------
-
-    if fvg_list:
-
-        evidence.append(
-            "Recent FVG detected"
-        )
-
-        score += 10
-
-    # -------------------------
-    # ORDER BLOCK
-    # -------------------------
-
-    if order_blocks:
-
-        evidence.append(
-            "Recent Order Block detected"
-        )
-
-        score += 10
-
-    score = min(score, 100)
-
-    if conflicts:
-
-        status = "CONDITIONAL"
-
-    elif score >= 70:
-
-        status = "STRONG_RESEARCH_SETUP"
-
-    elif score >= 50:
-
-        status = "MODERATE_RESEARCH_SETUP"
-
-    else:
-
-        status = "WAIT"
-
-    return {
-        "score": score,
-        "status": status,
-        "evidence": evidence,
-        "conflicts": conflicts
-    }
-
-
-# ============================================================
-# SCENARIO ENGINE
-# ============================================================
-
-def build_scenarios(
-    structure,
-    liquidity,
-    pd_zone
-):
-
-    scenarios = []
-
-    struct = structure.get(
-        "structure"
-    )
-
-    event = liquidity.get(
-        "event"
-    )
-
-    zone = pd_zone.get(
-        "zone"
-    )
-
-    if struct == "BULLISH_STRUCTURE":
-
-        scenarios.append({
-
-            "scenario":
-                "BULLISH_CONTINUATION",
-
-            "confirmation":
-                "Bullish structure remains intact and continuation is confirmed.",
-
-            "invalidation":
-                "Relevant bullish swing low is broken."
-        })
-
-    if struct == "BEARISH_STRUCTURE":
-
-        scenarios.append({
-
-            "scenario":
-                "BEARISH_CONTINUATION",
-
-            "confirmation":
-                "Bearish structure remains intact and continuation is confirmed.",
-
-            "invalidation":
-                "Relevant bearish swing high is broken."
-        })
-
-    if "SWEEP" in event:
-
-        scenarios.append({
-
-            "scenario":
-                "LIQUIDITY_SWEEP",
-
-            "confirmation":
-                "Sweep followed by structure confirmation.",
-
-            "invalidation":
-                "Price continues through the swept level."
-        })
-
-    if zone == "EQUILIBRIUM":
-
-        scenarios.append({
-
-            "scenario":
-                "MID_RANGE",
-
-            "confirmation":
-                "Wait for price to reach a clearer structural area.",
-
-            "invalidation":
-                "New confirmed structure develops."
-        })
-
-    return scenarios
-
-
-# ============================================================
-# 2E — TP / SL RESEARCH ENGINE
-# ============================================================
-
-def calculate_research_tp_sl(
-    df,
-    structure,
-    direction="AUTO",
-    rr_levels=(1.5, 2.0, 3.0)
-):
-
-    try:
-
-        if len(df) < 20:
-
-            return {
-                "status": "UNAVAILABLE",
-                "reason": "Insufficient data"
-            }
-
-        price = float(
-            df["Close"].iloc[-1]
-        )
-
-        if "ATR" not in df.columns:
-
-            return {
-                "status": "UNAVAILABLE",
-                "reason": "ATR column unavailable"
-            }
-
-        atr = df["ATR"].iloc[-1]
-
-        if pd.isna(atr) or atr <= 0:
-
-            return {
-                "status": "UNAVAILABLE",
-                "reason": "ATR unavailable"
-            }
-
-        if direction == "AUTO":
-
-            if structure.get(
-                "structure"
-            ) == "BULLISH_STRUCTURE":
-
-                direction = "BULLISH"
-
-            elif structure.get(
-                "structure"
-            ) == "BEARISH_STRUCTURE":
-
-                direction = "BEARISH"
-
-            else:
-
-                return {
-                    "status": "WAIT",
-                    "reason": "Direction uncertain"
-                }
-
-        swing_high = structure.get(
-            "last_swing_high"
-        )
-
-        swing_low = structure.get(
-            "last_swing_low"
-        )
-
-        if swing_high is None or swing_low is None:
-
-            return {
-                "status": "WAIT",
-                "reason": "Structure levels unavailable"
-            }
-
-        # -------------------------
-        # BULLISH
-        # -------------------------
-
-        if direction == "BULLISH":
-
-            sl = swing_low - (
-                0.25 * atr
-            )
-
-            risk = price - sl
-
-            if risk <= 0:
-
-                return {
-                    "status": "WAIT",
-                    "reason":
-                        "Invalid bullish geometry"
-                }
-
-            targets = {}
-
-            for rr in rr_levels:
-
-                targets[
-                    f"TP_{rr:g}R"
-                ] = price + (
-                    risk * rr
-                )
-
-        # -------------------------
-        # BEARISH
-        # -------------------------
-
-        else:
-
-            sl = swing_high + (
-                0.25 * atr
-            )
-
-            risk = sl - price
-
-            if risk <= 0:
-
-                return {
-                    "status": "WAIT",
-                    "reason":
-                        "Invalid bearish geometry"
-                }
-
-            targets = {}
-
-            for rr in rr_levels:
-
-                targets[
-                    f"TP_{rr:g}R"
-                ] = price - (
-                    risk * rr
-                )
-
-        return {
-
-            "status":
-                "RESEARCH_ONLY",
-
-            "direction":
-                direction,
-
-            "reference_price":
-                price,
-
-            "research_sl":
-                sl,
-
-            "risk_distance":
-                risk,
-
-            "targets":
-                targets,
-
-            "atr":
-                float(atr),
-
-            "note":
-                "Research/paper-trading levels only. "
-                "No future price is guaranteed."
-        }
-
-    except Exception as e:
-
-        logger.error(
-            f"TP/SL error: {e}"
-        )
-
-        return {
-            "status": "ERROR",
-            "reason": str(e)
-        }
-
-
-# ============================================================
-# 2F — SESSION / KILLZONE FILTER
-# ============================================================
-
-def session_filter(hour_utc):
-
-    # Broad UTC research windows.
-    # Exact broker/session settings should be configurable later.
-
-    if 7 <= hour_utc < 11:
-
-        return {
-            "status": "ACTIVE",
-            "session": "LONDON",
-            "reason":
-                "London research window"
-        }
-
-    if 12 <= hour_utc < 16:
-
-        return {
-            "status": "ACTIVE",
-            "session": "NEW_YORK",
-            "reason":
-                "New York research window"
-        }
-
-    if 0 <= hour_utc < 7:
-
-        return {
-            "status": "LOW_ACTIVITY",
-            "session": "ASIAN_EARLY",
-            "reason":
-                "Lower activity window"
-        }
-
-    return {
-        "status": "LOW_ACTIVITY",
-        "session": "OTHER",
-        "reason":
-            "Potential low-liquidity period"
-    }
-
-
-# ============================================================
-# NEWS BLOCKER
-# ============================================================
-
-def check_high_impact_news(
-    news_events,
-    minutes_ahead=30
-):
-
-    """
-    news_events must come from a structured
-    economic-calendar source.
-
-    Example:
-
-    {
-        "title": "CPI",
-        "impact": "HIGH",
-        "minutes_to_event": 15
-    }
-    """
-
-    for event in news_events:
-
-        impact = str(
-            event.get(
-                "impact",
-                ""
-            )
-        ).upper()
-
-        try:
-
-            minutes = float(
-                event.get(
-                    "minutes_to_event",
-                    999999
-                )
-            )
-
-        except Exception:
-
-            minutes = 999999
-
-        if (
-            impact == "HIGH"
-            and 0 <= minutes <= minutes_ahead
-        ):
-
-            return True
-
-    return False
-
-
-# ============================================================
-# PREMIUM / DISCOUNT GATE
-# ============================================================
-
-def premium_discount_gate(
-    pd_zone,
-    structure
-):
-
-    zone = pd_zone.get(
-        "zone",
-        "UNKNOWN"
-    )
-
-    struct = structure.get(
-        "structure",
-        "UNKNOWN"
-    )
-
-    if zone == "UNKNOWN":
-
-        return {
-            "status": "UNKNOWN",
-            "reason":
-                "Premium/Discount unavailable"
-        }
-
-    if (
-        struct == "BULLISH_STRUCTURE"
-        and zone == "DISCOUNT"
-    ):
-
-        return {
-            "status": "PASS",
-            "reason":
-                "Bullish structure + discount"
-        }
-
-    if (
-        struct == "BEARISH_STRUCTURE"
-        and zone == "PREMIUM"
-    ):
-
-        return {
-            "status": "PASS",
-            "reason":
-                "Bearish structure + premium"
-        }
-
-    if struct in [
-        "BULLISH_STRUCTURE",
-        "BEARISH_STRUCTURE"
-    ]:
-
-        return {
-            "status": "CAUTION",
-            "reason":
-                "Structure and P/D are not ideally aligned"
-        }
-
-    return {
-        "status": "UNKNOWN",
-        "reason":
-            "Structure uncertain"
-    }
-
-
-# ============================================================
-# LIQUIDITY GATE
-# ============================================================
-
-def liquidity_gate(liquidity):
-
-    event = liquidity.get(
-        "event",
-        "NONE"
-    )
-
-    if event == "UNKNOWN":
-
-        return {
-            "status": "UNKNOWN",
-            "reason":
-                "Liquidity analysis unavailable"
-        }
-
-    if "SWEEP" in event:
-
-        return {
-            "status": "CAUTION",
-            "reason":
-                "Liquidity sweep detected; confirmation required"
-        }
-
-    if "BOS" in event:
-
-        return {
-            "status": "PASS",
-            "reason":
-                "Close-based structure break detected"
-        }
-
-    return {
-        "status": "WAIT",
-        "reason":
-            "No confirmed liquidity event"
-    }
-
-
-# ============================================================
-# FINAL PROTECTION GATE
-# ============================================================
-
-def protection_gate(
-    session,
-    news_blocked,
-    pd_gate,
-    liquidity_gate_result,
-    confluence
-):
-
-    reasons = []
-
-    # Session filter
-    if session["status"] != "ACTIVE":
-
-        reasons.append(
-            session["reason"]
-        )
-
-    # News filter
-    if news_blocked:
-
-        reasons.append(
-            "High-impact news risk"
-        )
-
-    # Premium/Discount
-    if pd_gate["status"] in [
-        "UNKNOWN",
-        "CAUTION"
-    ]:
-
-        reasons.append(
-            pd_gate["reason"]
-        )
-
-    # Liquidity
-    if liquidity_gate_result["status"] in [
-        "UNKNOWN",
-        "WAIT",
-        "CAUTION"
-    ]:
-
-        reasons.append(
-            liquidity_gate_result["reason"]
-        )
-
-    # Confluence
-    if confluence["score"] < 50:
-
-        reasons.append(
-            "Insufficient confluence"
-        )
-
-    if reasons:
-
-        return {
-            "status": "WAIT",
-            "reasons": reasons
-        }
-
-    return {
-        "status": "PASS",
-        "reasons": []
-    }
-
-
-# ============================================================
-# 2C + 2D + 2E + 2F MASTER ENGINE
-# ============================================================
-
-def run_market_research(
-    df,
-    technical_summary,
-    news_events=None
-):
-
-    try:
-
-        news_events = (
-            news_events
-            if news_events is not None
-            else []
-        )
-
-        # ====================================================
-        # 2C
-        # ====================================================
-
-        df = detect_swing_points(df)
-
-        structure = determine_structure(df)
-
-        liquidity = detect_liquidity_event(df)
-
-        fvg_list = detect_fvg(df)
-
-        order_blocks = detect_order_blocks(df)
-
-        pd_zone = premium_discount_analysis(df)
-
-        # ====================================================
-        # 2D
-        # ====================================================
-
-        confluence = build_confluence(
-            technical_summary,
-            structure,
-            liquidity,
-            pd_zone,
-            fvg_list,
-            order_blocks
-        )
-
-        scenarios = build_scenarios(
-            structure,
-            liquidity,
-            pd_zone
-        )
-
-        # ====================================================
-        # 2E
-        # ====================================================
-
-        tp_sl = calculate_research_tp_sl(
-            df,
-            structure
-        )
-
-        # ====================================================
-        # 2F
-        # ====================================================
-
-        now_utc = pd.Timestamp.now(
-            tz="UTC"
-        )
-
-        session = session_filter(
-            now_utc.hour
-        )
-
-        news_blocked = check_high_impact_news(
-            news_events,
-            minutes_ahead=30
-        )
-
-        pd_gate = premium_discount_gate(
-            pd_zone,
-            structure
-        )
-
-        liq_gate = liquidity_gate(
-            liquidity
-        )
-
-        final_gate = protection_gate(
-            session,
-            news_blocked,
-            pd_gate,
-            liq_gate,
-            confluence
-        )
-
-        # ====================================================
-        # FINAL RESULT
-        # ====================================================
-
-        return {
-
-            "status": "ANALYZED",
-
-            "timestamp_utc":
-                str(now_utc),
-
-            "structure":
-                structure,
-
-            "liquidity":
-                liquidity,
-
-            "fvg":
-                fvg_list,
-
-            "order_blocks":
-                order_blocks,
-
-            "premium_discount":
-                pd_zone,
-
-            "confluence":
-                confluence,
-
-            "scenarios":
-                scenarios,
-
-            "tp_sl":
-                tp_sl,
-
-            "protection": {
-
-                "session":
-                    session,
-
-                "news_blocked":
-                    news_blocked,
-
-                "premium_discount_gate":
-                    pd_gate,
-
-                "liquidity_gate":
-                    liq_gate,
-
-                "final":
-                    final_gate
-            }
-        }
-
-    except Exception as e:
-
-        logger.error(
-            f"Master research error: {e}"
-        )
-
-        return {
-            "status": "ERROR",
-            "reason": str(e)
-        }
-
-
-# ============================================================
-# HUMAN-READABLE RESEARCH REPORT
-# ============================================================
-
-def format_research_report(
-    symbol,
-    timeframe,
-    result
-):
-
-    try:
-
-        structure = result.get(
-            "structure",
-            {}
-        )
-
-        liquidity = result.get(
-            "liquidity",
-            {}
-        )
-
-        pd_zone = result.get(
-            "premium_discount",
-            {}
-        )
-
-        confluence = result.get(
-            "confluence",
-            {}
-        )
-
-        tp_sl = result.get(
-            "tp_sl",
-            {}
-        )
-
-        protection = result.get(
-            "protection",
-            {}
-        )
-
-        session = protection.get(
-            "session",
-            {}
-        )
-
-        final_gate = protection.get(
-            "final",
-            {}
-        )
-
-        lines = [
-
-            "━━━━━━━━━━━━━━━━━━━━",
-            "🔎 MARKET RESEARCH",
-            "━━━━━━━━━━━━━━━━━━━━",
-
-            f"Market: {symbol}",
-            f"Timeframe: {timeframe}",
-
-            "",
-
-            "📐 STRUCTURE",
-            f"• {structure.get('structure', 'UNKNOWN')}",
-
-            "",
-
-            "💧 LIQUIDITY",
-            f"• {liquidity.get('event', 'NONE')}",
-
-            "",
-
-            "📊 PREMIUM / DISCOUNT",
-            f"• {pd_zone.get('zone', 'UNKNOWN')}",
-
-            "",
-
-            "🧠 CONFLUENCE",
-            f"• Score: {confluence.get('score', 0)}/100",
-            f"• Status: {confluence.get('status', 'WAIT')}",
-
-            "",
-
-            "🛡 PROTECTION",
-            f"• Session: {session.get('session', 'UNKNOWN')}",
-            f"• Session status: {session.get('status', 'UNKNOWN')}",
-            f"• News blocked: {protection.get('news_blocked', False)}",
-
-            "",
-
-            "🚦 FINAL DECISION",
-            f"• {final_gate.get('status', 'WAIT')}"
-        ]
-
-        # ----------------------------------------
-        # Reasons
-        # ----------------------------------------
-
-        reasons = final_gate.get(
-            "reasons",
-            []
-        )
-
-        if reasons:
-
-            lines.append("")
-
-            lines.append(
-                "Reasons:"
-            )
-
-            for reason in reasons[:8]:
-
-                lines.append(
-                    f"• {reason}"
-                )
-
-        # ----------------------------------------
-        # Evidence
-        # ----------------------------------------
-
-        evidence = confluence.get(
-            "evidence",
-            []
-        )
-
-        if evidence:
-
-            lines.append("")
-
-            lines.append(
-                "✅ Evidence:"
-            )
-
-            for item in evidence[:8]:
-
-                lines.append(
-                    f"• {item}"
-                )
-
-        # ----------------------------------------
-        # Conflicts
-        # ----------------------------------------
-
-        conflicts = confluence.get(
-            "conflicts",
-            []
-        )
-
-        if conflicts:
-
-            lines.append("")
-
-            lines.append(
-                "⚠️ Conflicts:"
-            )
-
-            for item in conflicts[:8]:
-
-                lines.append(
-                    f"• {item}"
-                )
-
-        # ----------------------------------------
-        # TP / SL Research
-        # ----------------------------------------
-
-        if tp_sl.get("status") == "RESEARCH_ONLY":
-
-            lines.extend([
-
-                "",
-                "📍 RESEARCH LEVELS",
-
-                f"• Direction: "
-                f"{tp_sl.get('direction')}",
-
-                f"• Reference: "
-                f"{tp_sl.get('reference_price'):.6f}",
-
-                f"• Research SL: "
-                f"{tp_sl.get('research_sl'):.6f}"
-            ])
-
-            targets = tp_sl.get(
-                "targets",
-                {}
-            )
-
-            for name, value in targets.items():
-
-                lines.append(
-                    f"• {name}: {value:.6f}"
-                )
-
-        else:
-
-            lines.extend([
-
-                "",
-                "📍 RESEARCH LEVELS",
-                "• Not available / WAIT"
-            ])
-
-        lines.extend([
-
-            "",
-            "⚠️ Research / Paper Trading Only",
-            "No future price or outcome is guaranteed.",
-
-            "━━━━━━━━━━━━━━━━━━━━"
-        ])
-
-        return "\n".join(lines)
-
-    except Exception as e:
-
-        logger.error(
-            f"Report formatting error: {e}"
-        )
-
-        return (
-            "Research report unavailable."
-        )
-
-
-# ============================================================
-# END OF STEP 2C + 2D + 2E + 2F
-# ============================================================
